@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         MAL Inline Scores
 // @namespace    https://myanimelist.net/
-// @version      4.5.6
-// @description  MAL scores, personal list status, settings dashboard, sharded bulk database, cache tools and automatic provider failover, resumable preloads, diagnostics, cross-tab request coordination and batched DOM scanning
+// @version      4.6.1
+// @description  MAL Inline Scores suite with optional English-dub-only recommendations
 // @match        https://myanimelist.net/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -14,6 +14,7 @@
 // @connect      api.jikan.moe
 // @connect      jikan.lucashdo.com
 // @connect      api.tenrai.org
+// @connect      raw.githubusercontent.com
 // @run-at       document-end
 // ==/UserScript==
 
@@ -54,6 +55,16 @@
   let dashboardProgressText = null;
   let dashboardTab = 'overview';
   let cacheFilter = '';
+  let discoveryFilter = '';
+  let discoveryMinScore = 7;
+  let discoverySort = 'score';
+  let discoveryStatus = 'unwatched';
+  let discoveryPage = 0;
+  const DISCOVERY_PAGE_SIZE = 30;
+  const HISTORY_PREFIX = 'history:anime:';
+  const HISTORY_LIMIT = 20;
+  const MAX_IMPORT_BYTES = 50 * 1024 * 1024;
+  const MAX_IMPORT_ENTRIES = 500000;
   let cachePage = 0;
   let cacheResults = null;
   let cacheIndex = null; // snapshot of live cache entries for the Cache tab
@@ -169,7 +180,23 @@
   // ---------- persistent live cache (shared by every MAL tab) ----------
   const validScore = value => typeof value === 'number' && Number.isFinite(value) && value > 0 && value <= 10;
   const getEntry = key => GM_getValue(PREFIX + key, null);
-  const setEntry = (key, data) => GM_setValue(PREFIX + key, { t: Date.now(), ...data });
+  function setEntry(key, data) {
+    const next = { t: Date.now(), ...data };
+    // Keep a small local history only when a real numeric score changes meaningfully.
+    if (/^anime:\d+$/.test(key) && validScore(next.score)) {
+      const previous = getEntry(key);
+      if (validScore(previous?.score) && Math.abs(previous.score - next.score) >= 0.05) {
+        const historyKey = HISTORY_PREFIX + key.slice(6);
+        const history = GM_getValue(historyKey, []);
+        const rows = Array.isArray(history) ? history.filter(x => x && Number.isFinite(x.score) && Number.isFinite(x.t)) : [];
+        if (!rows.length || rows[rows.length - 1].score !== previous.score) rows.push({ score: previous.score, t: previous.t || Date.now() });
+        rows.push({ score: next.score, t: next.t });
+        GM_setValue(historyKey, rows.slice(-HISTORY_LIMIT));
+      }
+    }
+    GM_setValue(PREFIX + key, next);
+    invalidateCaches();
+  }
   const isFresh = e => e && Number.isFinite(e.t) && Date.now() - e.t < (validScore(e.score) ? FRESH_MS : NO_SCORE_FRESH_MS);
   const allKeys = () => GM_listValues().filter(k => k.startsWith(PREFIX));
   const normaliseEntry = value => ({
@@ -182,6 +209,37 @@
   function invalidateCaches() {
     cacheIndex = null;
     summaryMemo = null;
+  }
+
+  function allBulkRows() {
+    const rows = [];
+    for (const key of shardKeys()) {
+      const shard = readShard(key);
+      for (const [id, raw] of Object.entries(shard || {})) {
+        if (!/^\d+$/.test(id) || !Array.isArray(raw) || !validScore(raw[0])) continue;
+        rows.push({ id, score: raw[0], scoredBy: Number(raw[1]) || 0, rank: Number(raw[2]) || 0, title: typeof raw[3] === 'string' ? raw[3] : `Anime ${id}`, t: Number(raw[4]) || 0 });
+      }
+    }
+    return rows;
+  }
+
+  function listStatusName(status) {
+    return ({ 1: 'Watching', 2: 'Completed', 3: 'On hold', 4: 'Dropped', 6: 'Plan to watch' })[Number(status)] || 'Not on list';
+  }
+
+  function isListEntryWatched(id) {
+    const row = myList?.items?.[id];
+    return !!row && [1, 2, 3, 4].includes(Number(row[0]));
+  }
+
+  function datasetStats() {
+    const rows = allBulkRows();
+    const scored = rows.filter(r => validScore(r.score));
+    const now = Date.now();
+    return { count: rows.length, fresh: rows.filter(r => r.t && now - r.t < BULK_FRESH_MS).length,
+      stale: rows.filter(r => !r.t || now - r.t >= BULK_FRESH_MS).length,
+      titles: rows.filter(r => r.title && !/^Anime \d+$/.test(r.title)).length,
+      average: scored.length ? scored.reduce((n, r) => n + r.score, 0) / scored.length : 0 };
   }
 
   // ---------- sharded bulk database ----------
@@ -290,7 +348,10 @@
   const providerLabel = provider => ({ jikan: 'Jikan', 'jikan-edge': 'Jikan Edge', tenrai: 'Tenrai' })[provider] || 'Jikan';
   const apiBase = provider => API_BASES[provider || settings.apiProvider] || API_BASES.jikan;
   const apiName = provider => providerLabel(provider || settings.apiProvider);
-  const providerHealth = Object.fromEntries(PROVIDER_ORDER.map(p => [p, { testedAt: 0, ok: null, ms: null, status: null, error: '' }]));
+  const DUB_DATA_URL = 'https://raw.githubusercontent.com/MAL-Dubs/MAL-Dubs/main/data/dubInfo.json';
+  const DUB_DATA_KEY = 'meta:dubData';
+  let dubDataState = { status: 'idle', ids: null, error: '' };
+  const providerHealth = Object.fromEntries(PROVIDER_ORDER.map(p => [p, { testedAt: 0, ok: null, ms: null, status: null, error: '', failures: 0, cooldownUntil: 0 }]));
 
   function apiRequest(path, provider) {
     return new Promise(resolve => {
@@ -1074,10 +1135,11 @@
           const json = await apiGet('/top/anime?page=1&limit=1', 0, provider, PROVIDER_ORDER.length, [...PROVIDER_ORDER]);
           const rows = Array.isArray(json?.data) ? json.data : [];
           if (!rows.length) throw new Error('API responded but returned no anime rows');
-          providerHealth[provider] = { testedAt: Date.now(), ok: true, ms: Date.now() - started, status: 200, error: '' };
+          providerHealth[provider] = { ...providerHealth[provider], testedAt: Date.now(), ok: true, ms: Date.now() - started, status: 200, error: '', failures: 0, cooldownUntil: 0 };
           results.push(`${apiName(provider)}: OK (${Date.now() - started} ms)`);
         } catch (e) {
-          providerHealth[provider] = { testedAt: Date.now(), ok: false, ms: Date.now() - started, status: providerHealth[provider].status, error: e.message };
+          const failures = (providerHealth[provider].failures || 0) + 1;
+          providerHealth[provider] = { ...providerHealth[provider], testedAt: Date.now(), ok: false, ms: Date.now() - started, status: providerHealth[provider].status, error: e.message, failures, cooldownUntil: failures >= 3 ? Date.now() + 60000 : providerHealth[provider].cooldownUntil || 0 };
           results.push(`${apiName(provider)}: FAILED (${e.message})`);
         }
       }
@@ -1182,7 +1244,9 @@
         bulkCache.delete(keys[i]); // always merge into what is really stored
         const shard = { ...readShard(keys[i]) };
         for (const [id, row] of byShard.get(keys[i])) {
-          shard[id] = [row.score, row.scoredBy, row.rank, row.title, row.t || Date.now()];
+          const incoming = [row.score, row.scoredBy, row.rank, typeof row.title === 'string' ? row.title.slice(0, 500) : '', row.t || Date.now()];
+          const existing = shard[id];
+          if (!Array.isArray(existing) || !Number.isFinite(Number(existing[4])) || Number(incoming[4]) >= Number(existing[4])) shard[id] = incoming;
           written++;
         }
         writeShard(keys[i], shard);
@@ -1224,6 +1288,7 @@
   }
 
   async function importBulkFile(file) {
+    if (file.size > MAX_IMPORT_BYTES) { toast('Bulk import rejected: file exceeds 50 MB'); return; }
     let parsed;
     try {
       parsed = JSON.parse(await file.text());
@@ -1232,6 +1297,7 @@
       return;
     }
     const entries = bulkEntriesFromJson(parsed);
+    if (entries.length > MAX_IMPORT_ENTRIES) { toast('Bulk import rejected: too many entries'); return; }
     if (!entries.length) {
       toast('Bulk import: no valid scores found in that file');
       return;
@@ -1272,6 +1338,7 @@
   }
 
   async function importCacheFile(file) {
+    if (file.size > MAX_IMPORT_BYTES) { toast('Cache import rejected: file exceeds 50 MB'); return; }
     try {
       const n = importCacheObject(JSON.parse(await file.text()));
       refreshAllBadges();
@@ -1286,12 +1353,13 @@
     const cache = {};
     allKeys().forEach(k => { cache[k.slice(PREFIX.length)] = GM_getValue(k); });
     downloadJson('mal-inline-scores-backup.json', {
-      app: 'mal-inline-scores', version: 1, exportedAt: Date.now(), settings, list: myList, cache, bulk: exportBulkObject(),
+      app: 'mal-inline-scores', version: 1, exportedAt: Date.now(), settings, list: myList, cache, bulk: exportBulkObject(), history: Object.fromEntries(GM_listValues().filter(k => k.startsWith(HISTORY_PREFIX)).map(k => [k, GM_getValue(k)])),
     });
     toast('Exported settings, list, cache and bulk scores');
   }
 
   async function importEverythingFile(file) {
+    if (file.size > MAX_IMPORT_BYTES) { toast('Restore rejected: file exceeds 50 MB'); return; }
     let parsed;
     try {
       parsed = JSON.parse(await file.text());
@@ -1313,6 +1381,7 @@
       myList = parsed.list;
       GM_setValue(LIST_KEY, myList);
     }
+    if (parsed.history && typeof parsed.history === 'object') { for (const [k, v] of Object.entries(parsed.history)) if (k.startsWith(HISTORY_PREFIX) && Array.isArray(v)) GM_setValue(k, v.filter(x => x && validScore(x.score) && Number.isFinite(x.t)).slice(-HISTORY_LIMIT)); }
     const cacheCount = importCacheObject(parsed.cache);
     const bulkEntries = bulkEntriesFromJson(parsed.bulk);
     if (bulkEntries.length) await importBulkEntries(bulkEntries, 'Restore bulk scores');
@@ -1513,12 +1582,12 @@
 
   function exportDiagnostics() {
     const report = {
-      app: 'MAL Inline Scores', version: '4.5.5', exportedAt: new Date().toISOString(),
+      app: 'MAL Inline Scores', version: '4.6.0', exportedAt: new Date().toISOString(),
       selectedProvider: settings.apiProvider, automaticFailover: settings.autoFailover,
       providers: providerHealth,
       metrics: { ...metrics }, queueLength: queue.length,
       sources: lanes.map(l => ({ name: l.name, coolingDown: sourceCoolingDown(l), cooldownUntil: Number(GM_getValue(`meta:disabled:${l.name}`, 0)) || null })),
-      cache: cacheSummary(true),
+      cache: cacheSummary(true), dataset: datasetStats(), scoreHistoryEntries: GM_listValues().filter(k => k.startsWith(HISTORY_PREFIX)).length,
       preloadProgress: GM_listValues().filter(k => k.startsWith('meta:preload:')).map(k => ({ key: k, value: GM_getValue(k) })),
     };
     downloadJson('mal-inline-scores-diagnostics.json', report);
@@ -1536,6 +1605,8 @@
     body.append(element('div', { class: 'mis-note' }, `Sources — ${cooling}`));
     body.append(element('div', { class: 'mis-note' }, `API health — ${PROVIDER_ORDER.map(p => { const h = providerHealth[p]; return `${apiName(p)}: ${h.ok === null ? 'not tested this session' : h.ok ? `OK · ${h.ms} ms` : `failed · ${h.error}`}`; }).join(' · ')}`));
     const hitRate = metrics.lookups ? Math.round((metrics.cacheHits + metrics.bulkHits) / metrics.lookups * 100) : 0;
+    const ds = datasetStats();
+    body.append(element('div', { class: 'mis-note' }, `Local dataset: ${ds.count.toLocaleString()} titles · ${ds.fresh.toLocaleString()} fresh · ${ds.stale.toLocaleString()} stale/undated · average score ${ds.average ? ds.average.toFixed(2) : 'n/a'}`));
     body.append(element('div', { class: 'mis-note' }, `This tab session: ${metrics.lookups.toLocaleString()} score lookups · ${metrics.requests.toLocaleString()} queued fetches · ${metrics.cacheHits.toLocaleString()} cache hits · ${metrics.bulkHits.toLocaleString()} bulk hits (${hitRate}% answered locally) · ${metrics.retries.toLocaleString()} retries · ${metrics.failures.toLocaleString()} final failures`));
     const listRow = element('div', { class: 'mis-row' });
     listRow.append(rowCopy('Personal MAL list', myList ? `${myList.user} · ${s.list.toLocaleString()} anime · refreshed ${new Date(myList.t).toLocaleString()}` : 'No list imported yet'));
@@ -1642,6 +1713,156 @@
     body.append(actions);
   }
 
+  function renderDiscoveryTab(body) {
+    const rows = allBulkRows();
+    const watched = myList?.items || {};
+    const search = element('input', { type: 'search', placeholder: 'Search your local score database…', value: discoveryFilter });
+    search.addEventListener('input', () => { discoveryFilter = search.value; discoveryPage = 0; renderDashboard(); });
+    body.append(search);
+    const controls = element('div', { class: 'mis-actions' });
+    const min = element('input', { type: 'number', min: '1', max: '10', step: '0.1', value: String(discoveryMinScore), style: 'width:85px' });
+    min.title = 'Minimum MAL score';
+    min.addEventListener('change', () => { discoveryMinScore = Math.max(1, Math.min(10, Number(min.value) || 1)); discoveryPage = 0; renderDashboard(); });
+    const sort = element('select', { class: 'mis-select', 'aria-label': 'Sort discovery results' });
+    [['score','Highest score'],['members','Most members'],['rank','Best rank'],['title','Title A–Z']].forEach(([v, label]) => { const o = element('option', { value: v }, label); o.selected = v === discoverySort; sort.append(o); });
+    sort.addEventListener('change', () => { discoverySort = sort.value; discoveryPage = 0; renderDashboard(); });
+    const status = element('select', { class: 'mis-select', 'aria-label': 'List status filter' });
+    [['unwatched','Not on list / plan to watch'],['not-listed','Not on my list'],['all','All titles'],['watching','Watching'],['completed','Completed'],['dropped','Dropped']].forEach(([v, label]) => { const o = element('option', { value: v }, label); o.selected = v === discoveryStatus; status.append(o); });
+    status.addEventListener('change', () => { discoveryStatus = status.value; discoveryPage = 0; renderDashboard(); });
+    controls.append(element('span', { class: 'mis-muted' }, 'Min score'), min, sort, status);
+    body.append(controls);
+    const q = discoveryFilter.trim().toLowerCase();
+    const matches = rows.filter(r => r.score >= discoveryMinScore && (!q || r.title.toLowerCase().includes(q) || r.id.includes(q))).filter(r => {
+      const item = watched[r.id]; const st = Number(item?.[0]);
+      if (discoveryStatus === 'not-listed') return !item;
+      if (discoveryStatus === 'unwatched') return !item || st === 6;
+      if (discoveryStatus === 'watching') return st === 1;
+      if (discoveryStatus === 'completed') return st === 2;
+      if (discoveryStatus === 'dropped') return st === 4;
+      return true;
+    });
+    matches.sort((a,b) => discoverySort === 'members' ? b.scoredBy-a.scoredBy : discoverySort === 'rank' ? (a.rank || 1e12)-(b.rank || 1e12) : discoverySort === 'title' ? a.title.localeCompare(b.title) : b.score-a.score);
+    const pages = Math.max(1, Math.ceil(matches.length / DISCOVERY_PAGE_SIZE));
+    discoveryPage = Math.min(discoveryPage, pages - 1);
+    body.append(element('div', { class: 'mis-note' }, `${matches.length.toLocaleString()} matches from ${rows.length.toLocaleString()} local scores. This view does not make API requests. Import or preload data in Imports & preload to expand coverage.`));
+    const list = element('div', { class: 'mis-cache-list' });
+    matches.slice(discoveryPage * DISCOVERY_PAGE_SIZE, (discoveryPage + 1) * DISCOVERY_PAGE_SIZE).forEach(r => {
+      const item = element('div', { class: 'mis-cache-item' });
+      const info = element('div', { class: 'mis-cache-title' });
+      info.append(element('div', {}, r.title), element('div', { class: 'mis-muted' }, `MAL #${r.id} · ★ ${r.score.toFixed(2)} · ${r.scoredBy.toLocaleString()} members${r.rank ? ` · rank #${r.rank}` : ''} · ${listStatusName(watched[r.id]?.[0])}`));
+      item.append(info, button('Open', () => window.open(`https://myanimelist.net/anime/${encodeURIComponent(r.id)}`, '_blank', 'noopener,noreferrer')));
+      list.append(item);
+    });
+    if (!matches.length) list.append(element('div', { class: 'mis-cache-item mis-muted' }, 'No matching local entries. Preload or import a dataset first.'));
+    body.append(list);
+    const pager = element('div', { class: 'mis-actions' });
+    pager.append(button('Previous', () => { discoveryPage = Math.max(0, discoveryPage - 1); renderDashboard(); }), element('span', { class: 'mis-muted' }, `Page ${discoveryPage + 1} of ${pages}`), button('Next', () => { discoveryPage = Math.min(pages - 1, discoveryPage + 1); renderDashboard(); }));
+    body.append(pager);
+  }
+
+  function loadDubData() {
+    if (dubDataState.status === 'loading') return;
+    const cached = GM_getValue(DUB_DATA_KEY, null);
+    if (cached?.ids && cached?.savedAt && Date.now() - cached.savedAt < 24 * 60 * 60 * 1000) {
+      dubDataState = { status: 'ready', ids: new Set(cached.ids.map(String)), error: '' };
+      renderDashboard();
+      return;
+    }
+    dubDataState = { status: 'loading', ids: null, error: '' };
+    GM_xmlhttpRequest({
+      method: 'GET', url: DUB_DATA_URL, headers: { Accept: 'application/json' }, timeout: 20000,
+      onload: response => {
+        try {
+          if (response.status !== 200) throw new Error(`HTTP ${response.status}`);
+          const parsed = JSON.parse(response.responseText);
+          if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('Unexpected dub data format');
+          const ids = new Set();
+          for (const values of Object.values(parsed)) {
+            if (!Array.isArray(values)) continue;
+            for (const id of values) if (Number.isInteger(Number(id)) && Number(id) > 0) ids.add(String(Number(id)));
+          }
+          if (!ids.size) throw new Error('Dub data contained no anime IDs');
+          const list = [...ids];
+          GM_setValue(DUB_DATA_KEY, { ids: list, savedAt: Date.now() });
+          dubDataState = { status: 'ready', ids: new Set(list), error: '' };
+        } catch (error) {
+          dubDataState = { status: 'error', ids: null, error: error.message || 'Could not parse dub data' };
+        }
+        renderDashboard();
+      },
+      onerror: () => { dubDataState = { status: 'error', ids: null, error: 'Network error loading MAL-Dubs data' }; renderDashboard(); },
+      ontimeout: () => { dubDataState = { status: 'error', ids: null, error: 'Timed out loading MAL-Dubs data' }; renderDashboard(); },
+    });
+  }
+
+  function renderInsightsTab(body) {
+    const items = Object.entries(myList?.items || {});
+    const counts = { Watching: 0, Completed: 0, 'On hold': 0, Dropped: 0, 'Plan to watch': 0, Other: 0 };
+    let personalScores = 0, scoreDiff = 0, missing = 0;
+    const recommendations = [];
+    const dubToggle = element('label', { class: 'mis-row', style: 'display:flex;align-items:center;gap:8px;margin-top:12px' });
+    const dubCheckbox = element('input', { type: 'checkbox' });
+    dubCheckbox.checked = !!settings.dubOnlyRecommendations;
+    dubCheckbox.disabled = dubDataState.status !== 'ready';
+    dubCheckbox.addEventListener('change', () => { settings.dubOnlyRecommendations = dubCheckbox.checked; saveSettings(); renderDashboard(); });
+    dubToggle.append(dubCheckbox, element('span', {}, 'English dub available only'));
+    body.append(dubToggle);
+    if (dubDataState.status === 'idle') {
+      body.append(element('div', { class: 'mis-note' }, 'Loading English-dub data from MAL-Dubs…'));
+      loadDubData();
+    } else if (dubDataState.status === 'loading') {
+      body.append(element('div', { class: 'mis-note' }, 'Loading English-dub data from MAL-Dubs…'));
+    } else if (dubDataState.status === 'error') {
+      body.append(element('div', { class: 'mis-note' }, `Could not load English-dub data: ${dubDataState.error}. Dub-only filtering is unavailable until data loads.`));
+      body.append(button('Retry dub data', () => { dubDataState.status = 'idle'; loadDubData(); }));
+    } else {
+      dubCheckbox.disabled = false;
+      body.append(element('div', { class: 'mis-muted' }, `Dub database loaded: ${dubDataState.ids.size.toLocaleString()} anime IDs. Data is cached locally for up to 24 hours.`));
+    }
+    for (const [id, tuple] of items) {
+      const status = listStatusName(tuple?.[0]); counts[counts[status] === undefined ? 'Other' : status]++;
+      const malScore = getBulkEntry('anime', id) || getEntry(`anime:${id}`);
+      const personal = Number(tuple?.[1]) || 0;
+      if (personal > 0 && validScore(malScore?.score)) { personalScores++; scoreDiff += personal - malScore.score; }
+      if (!malScore || !validScore(malScore.score)) missing++;
+    }
+    body.append(element('div', { class: 'mis-note' }, myList ? `Imported list: ${myList.user} · ${items.length.toLocaleString()} entries · average personal-vs-MAL difference ${personalScores ? (scoreDiff / personalScores).toFixed(2) : 'n/a'} across ${personalScores} scored comparisons.` : 'Import your MAL list in Settings to enable personal-list insights.'));
+    body.append(statGrid(Object.entries(counts).map(([k,v]) => [k, v])));
+    body.append(element('div', { class: 'mis-row' }, rowCopy('List score coverage', `${(items.length - missing).toLocaleString()} entries have a local MAL score · ${missing.toLocaleString()} need score data`)));
+    for (const r of allBulkRows()) {
+      const item = myList?.items?.[r.id];
+      if (r.score >= 8 && (!item || Number(item[0]) === 6) && (!settings.dubOnlyRecommendations || dubDataState.status !== 'ready' || dubDataState.ids.has(String(r.id)))) recommendations.push({ ...r, status: item ? 'Plan to watch' : 'Not on list' });
+    }
+    recommendations.sort((a,b) => b.score-a.score || b.scoredBy-a.scoredBy);
+    body.append(element('div', { style: 'font-weight:700;margin-top:12px' }, 'Recommended from your local database'));
+    body.append(element('div', { class: 'mis-muted' }, 'Highly rated titles you have not completed or dropped. Scores are local; dub availability comes from MAL-Dubs. The toggle filters to titles listed in its English-dub dataset.'));
+    const list = element('div', { class: 'mis-cache-list' });
+    recommendations.slice(0, 15).forEach(r => {
+      const item = element('div', { class: 'mis-cache-item' });
+      item.append(element('div', { class: 'mis-cache-title' }, `${r.title} · ${r.score.toFixed(2)} · ${r.status}`), button('Open', () => window.open(`https://myanimelist.net/anime/${encodeURIComponent(r.id)}`, '_blank', 'noopener,noreferrer')));
+      list.append(item);
+    });
+    if (!recommendations.length) list.append(element('div', { class: 'mis-cache-item mis-muted' }, 'No recommendations match these filters yet. Import/preload a larger score dataset or turn off the dub-only toggle.'));
+    body.append(list);
+    const historyCount = GM_listValues().filter(k => k.startsWith(HISTORY_PREFIX)).length;
+    body.append(element('div', { class: 'mis-note' }, `Score history is recorded when an anime's cached MAL score changes by at least 0.05. History currently covers ${historyCount.toLocaleString()} titles. It accumulates over time; it cannot reconstruct older scores.`));
+  }
+
+  function renderDataTab(body) {
+    const d = datasetStats();
+    body.append(statGrid([['Local titles', d.count], ['Fresh (<30 days)', d.fresh], ['Stale / undated', d.stale], ['With real titles', d.titles], ['Average score', d.average ? d.average.toFixed(2) : '—']]));
+    body.append(element('div', { class: 'mis-note' }, 'The local database is checked before remote lookups. Freshness is currently 30 days for bulk scores. Imports merge into the existing sharded dataset; keep a backup before importing a large external dataset.'));
+    const actions = element('div', { class: 'mis-actions' });
+    actions.append(button('Import dataset JSON', () => openFile('.json,application/json', importBulkFile), 'primary'));
+    actions.append(button('Export dataset JSON', () => { const out = exportBulkObject(); downloadJson('mal-bulk-scores.json', out); toast(`Exported ${Object.keys(out).length.toLocaleString()} local titles`); }));
+    actions.append(button('Export score history', () => { const out = Object.fromEntries(GM_listValues().filter(k => k.startsWith(HISTORY_PREFIX)).map(k => [k, GM_getValue(k)])); downloadJson('mal-score-history.json', out); toast('Score history exported'); }));
+    actions.append(button('Clear score history', () => { if (!confirm('Delete all recorded score history? Current scores and caches will remain.')) return; GM_listValues().filter(k => k.startsWith(HISTORY_PREFIX)).forEach(k => GM_deleteValue(k)); renderDashboard(); toast('Score history cleared'); }, 'danger'));
+    body.append(actions);
+    const recent = allBulkRows().sort((a,b) => b.t-a.t).slice(0,5);
+    body.append(element('div', { style: 'font-weight:700;margin-top:12px' }, 'Recently updated local entries'));
+    recent.forEach(r => body.append(element('div', { class: 'mis-row' }, rowCopy(r.title, `★ ${r.score.toFixed(2)} · ${r.t ? new Date(r.t).toLocaleString() : 'timestamp unavailable'}`))));
+  }
+
   function renderTasksTab(body) {
     body.append(element('div', { class: 'mis-muted' }, 'Long-running imports and preloads share one progress display. You can cancel between steps; a request already in flight may finish first.'));
     const actions = element('div', { class: 'mis-actions' });
@@ -1668,6 +1889,9 @@
     clearChildren(body);
     cacheResults = null;
     if (dashboardTab === 'overview') renderOverviewTab(body);
+    else if (dashboardTab === 'discovery') renderDiscoveryTab(body);
+    else if (dashboardTab === 'insights') renderInsightsTab(body);
+    else if (dashboardTab === 'data') renderDataTab(body);
     else if (dashboardTab === 'settings') renderSettingsTab(body);
     else if (dashboardTab === 'cache') renderCacheTab(body);
     else renderTasksTab(body);
@@ -1690,7 +1914,7 @@
     head.append(button('×', () => { dashboardRoot.hidden = true; }));
     dashboardRoot.append(head);
     const tabs = element('nav', { class: 'mis-tabs', role: 'tablist' });
-    [['overview', 'Overview'], ['settings', 'Settings'], ['cache', 'Cache'], ['tasks', 'Imports & preload']].forEach(([id, label]) => {
+    [['overview', 'Overview'], ['discovery', 'Discover'], ['insights', 'My list'], ['data', 'Dataset'], ['settings', 'Settings'], ['cache', 'Cache'], ['tasks', 'Imports & preload']].forEach(([id, label]) => {
       const b = button(label, () => {
         dashboardTab = id;
         tabs.querySelectorAll('button').forEach(x => x.setAttribute('aria-selected', String(x.dataset.tab === id)));
@@ -1710,7 +1934,7 @@
     progressWrap.append(dashboardProgress);
     dashboardRoot.append(progressWrap);
     dashboardRoot.append(element('div', { class: 'mis-body' }));
-    dashboardRoot.append(element('div', { class: 'mis-foot' }, 'MAL Inline Scores · selectable Jikan / Jikan Edge / Tenrai APIs · settings saved in Tampermonkey storage'));
+    dashboardRoot.append(element('div', { class: 'mis-foot' }, 'MAL Inline Scores 4.6.0 · local-first scores · discovery and list insights · data remains in Tampermonkey storage'));
     document.body.append(launcherEl, dashboardRoot);
     renderDashboard();
   }
