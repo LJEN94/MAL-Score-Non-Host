@@ -1,0 +1,1755 @@
+// ==UserScript==
+// @name         MAL Inline Scores
+// @namespace    https://myanimelist.net/
+// @version      4.5.6
+// @description  MAL scores, personal list status, settings dashboard, sharded bulk database, cache tools and automatic provider failover, resumable preloads, diagnostics, cross-tab request coordination and batched DOM scanning
+// @match        https://myanimelist.net/*
+// @grant        GM_xmlhttpRequest
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        GM_deleteValue
+// @grant        GM_listValues
+// @grant        GM_registerMenuCommand
+// @grant        GM_addValueChangeListener
+// @connect      api.jikan.moe
+// @connect      jikan.lucashdo.com
+// @connect      api.tenrai.org
+// @run-at       document-end
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  const PREFIX = 'mal:'; // live score cache entries
+  const BULK_SHARD_PREFIX = 'bulk:s:'; // sharded bulk dataset: one key per 500 anime ids
+  const LEGACY_BULK_PREFIX = 'bulk:anime:'; // old one-key-per-anime layout, migrated automatically
+  const BULK_SHARD_SIZE = 500;
+  const BULK_CACHE_TTL = 30 * 1000; // in-memory shard cache lifetime
+  const FRESH_MS = 7 * 24 * 60 * 60 * 1000; // scored entries are reused for 7 days
+  const NO_SCORE_FRESH_MS = 6 * 60 * 60 * 1000; // entries without a score are rechecked after 6 hours
+  const BULK_FRESH_MS = 30 * 24 * 60 * 60 * 1000; // bulk scores count as fresh for 30 days
+  const PRUNE_MS = 90 * 24 * 60 * 60 * 1000; // entries not refreshed for 90 days are deleted
+  const JIKAN_ASSIST_QUEUE = 5; // Jikan also takes jobs once more than this many are waiting
+  const CANCELLED = 'Cancelled by user';
+  const LINK_SELECTOR = 'a[href*="/anime/"], a[href*="/manga/"]';
+  // MAL sometimes links a media entry from a generic relationship label (e.g. "Web manga")
+  // rather than from its title. Do not attach score pills to those category/source labels.
+  const NON_TITLE_LABELS = new Set([
+    'anime', 'manga', 'web manga', 'light novel', 'novel', 'visual novel', 'game',
+    'card game', 'book', 'picture book', '4-koma manga', 'original', 'other',
+    'music', 'radio', 'mixed media', 'web novel', 'digital manga', 'print manga',
+    'manhwa', 'manhua', 'doujinshi', 'unknown', 'source', 'related entries'
+  ]);
+  const LINK_RE = /^\/(anime|manga)\/(\d+)(?:\/[^/?#]*)?\/?$/;
+
+  const log = (...args) => console.log('[MAL Inline Scores]', ...args);
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  log('loaded');
+
+  // ---------- shared UI state (declared early so nothing hits a temporal-dead-zone) ----------
+  let dashboardRoot = null;
+  let launcherEl = null;
+  let dashboardStatus = null;
+  let dashboardProgress = null;
+  let dashboardProgressText = null;
+  let dashboardTab = 'overview';
+  let cacheFilter = '';
+  let cachePage = 0;
+  let cacheResults = null;
+  let cacheIndex = null; // snapshot of live cache entries for the Cache tab
+  let summaryMemo = null; // memoised cache statistics
+  let searchTimer = null;
+  let toastEl = null;
+  let toastTimer = null;
+  const CACHE_PAGE_SIZE = 40;
+  const taskState = { active: false, cancelled: false, label: '', done: 0, total: 0, message: 'Ready' };
+
+  // ---------- badge styles ----------
+  const style = document.createElement('style');
+  style.textContent = `
+    /* One pill per link: [★ score | list status]. Declarations are !important and the
+       base is reset with "all: initial" so the site's own span styles can't break it. */
+    html .mal-chip.mal-chip {
+      all: initial !important;
+      display: inline-flex !important;
+      align-items: stretch !important;
+      vertical-align: middle !important;
+      margin: 0 0 0 6px !important;
+      border-radius: 999px !important;
+      overflow: hidden !important;
+      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.28) !important;
+      font: 600 11px/1 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif !important;
+      font-variant-numeric: tabular-nums !important;
+      white-space: nowrap !important;
+      cursor: help !important;
+      text-decoration: none !important;
+    }
+    .mal-chip .mal-seg {
+      all: initial !important;
+      display: inline-block !important;
+      padding: 3px 8px !important;
+      color: #fff !important;
+      font: inherit !important;
+      line-height: 1 !important;
+      letter-spacing: 0.01em !important;
+      text-decoration: none !important;
+      cursor: help !important;
+    }
+    .mal-chip .mal-score::before {
+      content: "★" !important;
+      margin-right: 3px !important;
+      font-size: 10px !important;
+      opacity: 0.85 !important;
+    }
+    .mal-chip .mal-score.t-great { background: #1f9d55 !important; }
+    .mal-chip .mal-score.t-good { background: #3566c9 !important; }
+    .mal-chip .mal-score.t-mixed { background: #c27c0e !important; }
+    .mal-chip .mal-score.t-poor { background: #c2410c !important; }
+    .mal-chip .mal-score.na { background: #7b8190 !important; }
+    .mal-chip .mal-score.loading {
+      background: #7b8190 !important;
+      animation: mal-pulse 1.2s ease-in-out infinite !important;
+    }
+    @keyframes mal-pulse { 0%, 100% { opacity: 0.55; } 50% { opacity: 1; } }
+    .mal-chip .mal-list { border-left: 1px solid rgba(255, 255, 255, 0.45) !important; }
+    .mal-chip .mal-list.s1 { background: #2db039 !important; }
+    .mal-chip .mal-list.s2 { background: #26448f !important; }
+    .mal-chip .mal-list.s3 { background: #f9d457 !important; color: #3a2f00 !important; }
+    .mal-chip .mal-list.s4 { background: #a12f31 !important; }
+    .mal-chip .mal-list.s6 { background: #c3c8d1 !important; color: #2b2f38 !important; }
+    html.mal-compact .mal-chip.mal-chip { margin-left: 4px !important; font-size: 10px !important; }
+    html.mal-compact .mal-chip .mal-seg { padding: 2px 6px !important; }
+    html.mal-compact .mal-chip .mal-score::before { display: none !important; }
+    html .mal-seen.mal-seen.mal-seen { opacity: 0.4 !important; transition: opacity 0.15s !important; }
+    html .mal-seen.mal-seen.mal-seen:hover { opacity: 1 !important; }
+    html .mal-hide-seen.mal-hide-seen { display: none !important; }
+  `;
+  document.head.appendChild(style);
+
+  // ---------- settings ----------
+  const SETTINGS_KEY = 'settings';
+  const SEEN_MODES = ['dim', 'hide', 'off'];
+  function normaliseSettings(raw) {
+    return {
+      seen: SEEN_MODES.includes(raw?.seen) ? raw.seen : 'dim',
+      manga: raw?.manga === true,
+      tooltips: raw?.tooltips !== false,
+      compact: raw?.compact === true,
+      launcher: raw?.launcher !== false,
+      apiProvider: ['jikan', 'jikan-edge', 'tenrai'].includes(raw?.apiProvider) ? raw.apiProvider : 'jikan',
+      autoFailover: raw?.autoFailover !== false,
+    };
+  }
+  const settings = normaliseSettings(GM_getValue(SETTINGS_KEY, {}));
+  const saveSettings = () => GM_setValue(SETTINGS_KEY, settings);
+
+  function applySettings() {
+    document.documentElement.classList.toggle('mal-compact', settings.compact);
+    if (launcherEl) launcherEl.hidden = !settings.launcher;
+  }
+  applySettings();
+
+  // One reusable toast, bottom-left, so repeated messages replace each other instead of stacking.
+  function toast(msg) {
+    if (!document.body) return;
+    if (!toastEl) {
+      toastEl = document.createElement('div');
+      toastEl.className = 'mis-toast';
+      toastEl.style.cssText = 'position:fixed;left:16px;bottom:16px;z-index:2147483647;background:#222;'
+        + 'color:#fff;font:13px/1.3 -apple-system,"Segoe UI",Roboto,sans-serif;padding:8px 12px;'
+        + 'border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.4);max-width:min(420px,calc(100vw - 32px))';
+    }
+    toastEl.textContent = msg;
+    if (!toastEl.isConnected) document.body.appendChild(toastEl);
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => toastEl.remove(), 3000);
+    renderDashboardStatus();
+  }
+
+  // ---------- persistent live cache (shared by every MAL tab) ----------
+  const validScore = value => typeof value === 'number' && Number.isFinite(value) && value > 0 && value <= 10;
+  const getEntry = key => GM_getValue(PREFIX + key, null);
+  const setEntry = (key, data) => GM_setValue(PREFIX + key, { t: Date.now(), ...data });
+  const isFresh = e => e && Number.isFinite(e.t) && Date.now() - e.t < (validScore(e.score) ? FRESH_MS : NO_SCORE_FRESH_MS);
+  const allKeys = () => GM_listValues().filter(k => k.startsWith(PREFIX));
+  const normaliseEntry = value => ({
+    score: validScore(value.score) ? value.score : null,
+    scoredBy: Number.isFinite(Number(value.scoredBy ?? value.scored_by)) ? Number(value.scoredBy ?? value.scored_by) || null : null,
+    rank: Number.isFinite(Number(value.rank)) ? Number(value.rank) || null : null,
+    title: typeof value.title === 'string' ? value.title : '',
+  });
+
+  function invalidateCaches() {
+    cacheIndex = null;
+    summaryMemo = null;
+  }
+
+  // ---------- sharded bulk database ----------
+  // bulk:s:<n> holds { [animeId]: [score, scoredBy, rank, title, timestamp] } for ids n*500 .. n*500+499.
+  const bulkCache = new Map(); // shard key -> { shard, at }
+  let legacyBulkPending = GM_listValues().some(k => k.startsWith(LEGACY_BULK_PREFIX));
+
+  const shardKey = id => BULK_SHARD_PREFIX + Math.floor(Number(id) / BULK_SHARD_SIZE);
+  const shardKeys = () => GM_listValues().filter(k => k.startsWith(BULK_SHARD_PREFIX));
+
+  function readShard(key) {
+    const hit = bulkCache.get(key);
+    if (hit && Date.now() - hit.at < BULK_CACHE_TTL) return hit.shard;
+    const stored = GM_getValue(key, null);
+    if (!stored) return {};
+    bulkCache.set(key, { shard: stored, at: Date.now() });
+    return stored;
+  }
+
+  function writeShard(key, shard) {
+    bulkCache.set(key, { shard, at: Date.now() });
+    GM_setValue(key, shard);
+  }
+
+  const rowToEntry = row => ({
+    score: row[0], scoredBy: row[1], rank: row[2], title: row[3], t: row[4] || 0, source: 'bulk',
+  });
+
+  function getBulkEntry(type, id) {
+    if (type !== 'anime') return null;
+    const row = readShard(shardKey(id))[id];
+    if (row) return rowToEntry(row);
+    if (legacyBulkPending) {
+      const legacy = GM_getValue(LEGACY_BULK_PREFIX + id, null);
+      if (legacy) return { ...normaliseEntry(legacy), t: legacy.t || 0, source: 'bulk' };
+    }
+    return null;
+  }
+
+  function bulkCount() {
+    let n = 0;
+    for (const k of shardKeys()) n += Object.keys(readShard(k)).length;
+    return n + GM_listValues().filter(k => k.startsWith(LEGACY_BULK_PREFIX)).length;
+  }
+
+  // Move any old bulk:anime:<id> keys into shards, in chunks so the page never freezes.
+  async function migrateLegacyBulk() {
+    if (!legacyBulkPending) return;
+    if (Date.now() - GM_getValue('meta:bulkMigrate', 0) < 60000) return;
+    GM_setValue('meta:bulkMigrate', Date.now());
+    const keys = GM_listValues().filter(k => k.startsWith(LEGACY_BULK_PREFIX));
+    const touched = new Map();
+    for (let i = 0; i < keys.length; i++) {
+      const id = keys[i].slice(LEGACY_BULK_PREFIX.length);
+      const legacy = GM_getValue(keys[i], null);
+      if (legacy && validScore(legacy.score)) {
+        const sk = shardKey(id);
+        if (!touched.has(sk)) touched.set(sk, { ...readShard(sk) });
+        touched.get(sk)[id] = [legacy.score, legacy.scoredBy ?? null, legacy.rank ?? null, legacy.title || '', legacy.t || Date.now()];
+      }
+      if (i % 500 === 499) await sleep(0);
+    }
+    touched.forEach((shard, sk) => writeShard(sk, shard));
+    keys.forEach(k => GM_deleteValue(k));
+    legacyBulkPending = false;
+    invalidateCaches();
+    log(`migrated ${keys.length} legacy bulk entries into ${touched.size} shards`);
+  }
+  setTimeout(migrateLegacyBulk, 8000);
+
+  // Best value we already know for a link, and whether it is fresh enough to skip the network.
+  function lookupKnown(type, id) {
+    const cached = getEntry(`${type}:${id}`);
+    if (isFresh(cached)) return { entry: cached, fresh: true };
+    const bulk = getBulkEntry(type, id);
+    if (bulk && validScore(bulk.score) && Date.now() - bulk.t < BULK_FRESH_MS && (!cached || bulk.t > (cached.t || 0))) {
+      return { entry: bulk, fresh: true };
+    }
+    return { entry: cached || bulk, fresh: false };
+  }
+
+  // Delete entries that haven't been refreshed in 90 days (runs at most once a day).
+  function prune() {
+    const last = GM_getValue('meta:lastPrune', 0);
+    if (Date.now() - last < 24 * 60 * 60 * 1000) return;
+    GM_setValue('meta:lastPrune', Date.now());
+    let removed = 0;
+    for (const k of allKeys()) {
+      const e = GM_getValue(k);
+      if (!e || (e.t > 0 && Date.now() - e.t > PRUNE_MS)) {
+        GM_deleteValue(k);
+        removed++;
+      }
+    }
+    if (removed) log(`pruned ${removed} old cache entries`);
+  }
+  setTimeout(prune, 5000);
+
+  // ---------- selectable API provider: Jikan v4, Jikan Edge, or Tenrai ----------
+  const API_BASES = {
+    jikan: 'https://api.jikan.moe/v4',
+    'jikan-edge': 'https://jikan.lucashdo.com/v1',
+    tenrai: 'https://api.tenrai.org/v1',
+  };
+  const PROVIDER_ORDER = ['jikan', 'jikan-edge', 'tenrai'];
+  const providerLabel = provider => ({ jikan: 'Jikan', 'jikan-edge': 'Jikan Edge', tenrai: 'Tenrai' })[provider] || 'Jikan';
+  const apiBase = provider => API_BASES[provider || settings.apiProvider] || API_BASES.jikan;
+  const apiName = provider => providerLabel(provider || settings.apiProvider);
+  const providerHealth = Object.fromEntries(PROVIDER_ORDER.map(p => [p, { testedAt: 0, ok: null, ms: null, status: null, error: '' }]));
+
+  function apiRequest(path, provider) {
+    return new Promise(resolve => {
+      const started = Date.now();
+      GM_xmlhttpRequest({
+        method: 'GET',
+        url: apiBase(provider) + path,
+        headers: { Accept: 'application/json' },
+        timeout: 20000,
+        onload: res => {
+          let json = null;
+          try { json = JSON.parse(res.responseText); } catch (e) { /* not JSON */ }
+          resolve({ status: res.status, json, elapsed: Date.now() - started, retryAfter: Number(res.responseHeaders?.match(/^retry-after:\s*(\d+)/im)?.[1] || 0) });
+        },
+        onerror: () => resolve({ status: 0, json: null, elapsed: Date.now() - started, networkError: true }),
+        ontimeout: () => resolve({ status: 0, json: null, elapsed: Date.now() - started, timedOut: true }),
+        onabort: () => resolve({ status: 0, json: null, elapsed: Date.now() - started, aborted: true }),
+      });
+    });
+  }
+
+  function validateApiResponse(res, provider) {
+    if (res.status !== 200) {
+      const message = res.json?.message || res.json?.error?.message || res.json?.error || '';
+      const status = res.status === 0 ? (res.timedOut ? 'timed out' : res.networkError ? 'network error' : 'connection failed') : `HTTP ${res.status}`;
+      throw new Error(`${apiName(provider)} ${status}${message ? `: ${message}` : ''}`);
+    }
+    if (!res.json || typeof res.json !== 'object') throw new Error(`${apiName(provider)} returned invalid JSON`);
+    if (provider === 'jikan-edge' && res.json.error) throw new Error(`Jikan Edge API error: ${res.json.error.message || res.json.error.code || JSON.stringify(res.json.error)}`);
+    if (provider === 'tenrai' && res.json.type && res.json.message && !Array.isArray(res.json.data)) throw new Error(`Tenrai API error: ${res.json.message}`);
+    if (res.json.errors) {
+      const details = typeof res.json.errors === 'string' ? res.json.errors : JSON.stringify(res.json.errors);
+      throw new Error(`${apiName(provider)} API error: ${details}`);
+    }
+    return res.json;
+  }
+
+  async function apiGet(path, tries = 0, provider = settings.apiProvider, fallbackIndex = 0, triedProviders = [provider]) {
+    const lane = laneByName.jikan;
+    await reserveSlot(lane);
+    const res = await apiRequest(path, provider);
+    const health = providerHealth[provider];
+    health.testedAt = Date.now(); health.ms = res.elapsed; health.status = res.status;
+    try {
+      const json = validateApiResponse(res, provider);
+      health.ok = true; health.error = '';
+      return json;
+    } catch (err) {
+      health.ok = false; health.error = err.message;
+      if ((res.status === 429 || res.status === 0 || res.status >= 500) && tries < 2) {
+        const retryHeader = Number(res.retryAfter || 0);
+        const backoffMs = res.status === 429 ? Math.max(retryHeader * 1000, 5000 * (tries + 1)) : 1500 * (tries + 1);
+        penalize(lane, backoffMs);
+        await sleep(backoffMs);
+        return apiGet(path, tries + 1, provider, fallbackIndex, triedProviders);
+      }
+      if (settings.autoFailover && (res.status === 0 || res.status === 429 || res.status >= 500 || res.status === 200)) {
+        const next = PROVIDER_ORDER.find(p => !triedProviders.includes(p));
+        if (next) {
+          log(`${apiName(provider)} failed; trying ${apiName(next)}: ${err.message}`);
+          return apiGet(path, 0, next, fallbackIndex + 1, [...triedProviders, next]);
+        }
+      }
+      throw err;
+    }
+  }
+
+  const toEntry = d => ({
+    score: validScore(d?.score) ? d.score : null,
+    scoredBy: d?.scoredBy ?? d?.scored_by ?? d?.ratingCount ?? null,
+    rank: d?.rank ?? null,
+    title: d?.title ?? d?.titleEnglish ?? d?.titleJapanese ?? '',
+  });
+  const noDataEntry = () => ({ score: null, scoredBy: null, rank: null, title: '', notFound: true });
+
+  async function jikanEntry(type, id, lane) {
+    let res;
+    try { res = { status: 200, json: await apiGet(`/${type}/${id}`) }; }
+    catch (e) { log(`${apiName()} lookup failed`, type, id, e.message); return null; }
+    const payload = res.json?.data;
+    if (res.status === 200 && payload && typeof payload === 'object' && !Array.isArray(payload)) return toEntry(payload);
+    if (res.status === 404) return noDataEntry(); // a genuinely missing entry is data, not a source failure
+    if (res.status === 429) penalize(lane, 15000);
+    else if (res.status >= 500 || res.status === 0) penalize(lane, 4000);
+    return null;
+  }
+
+  // ---------- data source 2: the MAL page itself (same origin) ----------
+  function parseLd(doc) {
+    for (const s of doc.querySelectorAll('script[type="application/ld+json"]')) {
+      try {
+        const parsed = JSON.parse(s.textContent);
+        const nodes = Array.isArray(parsed) ? parsed : [parsed];
+        for (const node of nodes) {
+          const agg = node?.aggregateRating;
+          if (agg && agg.ratingValue != null) {
+            return {
+              score: parseFloat(agg.ratingValue),
+              scoredBy: parseInt(agg.ratingCount ?? agg.reviewCount, 10),
+            };
+          }
+        }
+      } catch (e) { /* ignore malformed block */ }
+    }
+    return null;
+  }
+
+  async function scrapeMal(type, id, lane) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 15000);
+    try {
+      const res = await fetch(`https://myanimelist.net/${type}/${id}`, {
+        credentials: 'same-origin',
+        signal: ctrl.signal,
+      });
+      if (res.status === 429 || res.status === 403) {
+        penalize(lane, 15000);
+        return null;
+      }
+      if (res.status === 404) return noDataEntry();
+      if (!res.ok) {
+        if (res.status >= 500) penalize(lane, 4000);
+        return null;
+      }
+      const doc = new DOMParser().parseFromString(await res.text(), 'text/html');
+      const txt = sel => (doc.querySelector(sel)?.textContent || '').trim();
+      const num = s => parseFloat(s.replace(/,/g, ''));
+      const ld = parseLd(doc);
+      const score = ld ? ld.score : num(txt('[itemprop="ratingValue"]') || txt('.score-label'));
+      const users = ld ? ld.scoredBy : num(txt('[itemprop="ratingCount"]'));
+      const rank = num((txt('.ranked strong').match(/\d[\d,]*/) || [''])[0]);
+      return {
+        score: validScore(score) ? score : null,
+        scoredBy: Number.isFinite(users) ? users : null,
+        rank: Number.isFinite(rank) ? rank : null,
+        title: txt('.title-name') || txt('h1'),
+      };
+    } catch (e) {
+      penalize(lane, 4000);
+      log('MAL page fallback failed', e.name === 'AbortError' ? 'timeout' : e);
+      return null;
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  // ---------- rate limiting and cooldowns shared across all open MAL tabs ----------
+  const SOURCE_COOLDOWN_MS = 10 * 60 * 1000;
+  const SOURCE_FAILURE_LIMIT = 3;
+  const lanes = [
+    { name: 'mal', gap: 700, fails: 0, running: false, wakeTimer: null, wakeAt: 0, run: scrapeMal },
+    { name: 'jikan', gap: 1200, fails: 0, running: false, wakeTimer: null, wakeAt: 0, run: jikanEntry },
+  ];
+  const laneByName = Object.fromEntries(lanes.map(lane => [lane.name, lane]));
+
+  const sourceCoolingDown = lane => Number(GM_getValue(`meta:disabled:${lane.name}`, 0)) > Date.now();
+  const allSourcesCooling = () => lanes.every(sourceCoolingDown);
+
+  // One wake-up timer per lane (not one per call), so a busy page can't pile timers up.
+  function scheduleSourceWake(lane) {
+    const until = Number(GM_getValue(`meta:disabled:${lane.name}`, 0));
+    if (until <= Date.now()) return;
+    if (lane.wakeTimer && lane.wakeAt === until) return;
+    clearTimeout(lane.wakeTimer);
+    lane.wakeAt = until;
+    lane.wakeTimer = setTimeout(() => {
+      lane.wakeTimer = null;
+      lane.wakeAt = 0;
+      updatePausedState();
+      lanes.forEach(startLane);
+    }, until - Date.now() + 25);
+  }
+
+  // Loading badges explain themselves when every source is cooling down.
+  function updatePausedState() {
+    const paused = allSourcesCooling();
+    document.querySelectorAll(LINK_SELECTOR).forEach(link => {
+      const badge = link._malBadge;
+      if (badge && badge.classList.contains('loading')) {
+        badge.title = paused ? 'Score sources are paused; retrying automatically' : 'Loading score…';
+      }
+    });
+  }
+
+  function recordSourceFailure(lane) {
+    lane.fails = (lane.fails || 0) + 1;
+    if (lane.fails >= SOURCE_FAILURE_LIMIT) {
+      GM_setValue(`meta:disabled:${lane.name}`, Date.now() + SOURCE_COOLDOWN_MS);
+      log(`${lane.name} paused for ${SOURCE_COOLDOWN_MS / 60000} minutes after repeated failures`);
+      lane.fails = 0;
+      scheduleSourceWake(lane);
+      updatePausedState();
+      lanes.forEach(startLane); // let the other source pick up anything it was holding back
+    }
+  }
+
+  function recordSourceSuccess(lane) {
+    lane.fails = 0;
+    GM_deleteValue(`meta:disabled:${lane.name}`);
+  }
+
+  const slotKey = lane => `meta:next:${lane.name}`;
+
+  // Claims the next free request slot for a source. The "next free time" lives in
+  // shared storage, so several tabs together still respect each source's limit.
+  async function reserveSlot(lane) {
+    const now = Date.now();
+    const next = Math.max(now, GM_getValue(slotKey(lane), 0));
+    GM_setValue(slotKey(lane), next + lane.gap);
+    if (next > now) await sleep(next - now);
+  }
+
+  // After a rate-limit/failure: pause the source for base * 2^fails ms (max 60s), in every tab.
+  function penalize(lane, baseMs) {
+    const ms = Math.min(60000, baseMs * (2 ** Math.min(lane.fails || 0, 4)));
+    GM_setValue(slotKey(lane), Math.max(GM_getValue(slotKey(lane), 0), Date.now() + ms));
+    log(`${lane.name} backing off for ${Math.round(ms / 1000)}s`);
+  }
+
+  // ---------- cross-tab request coordination ----------
+  // A short lease prevents multiple MAL tabs requesting the same score simultaneously.
+  const TAB_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+  const REQUEST_LEASE_MS = 30000;
+  async function acquireScoreLease(key) {
+    const lockKey = `meta:requestLock:${key}`;
+    const started = Date.now();
+    while (Date.now() - started < 12000) {
+      const cached = getEntry(key);
+      if (isFresh(cached)) return { cached, release: () => {} };
+      const now = Date.now();
+      const current = GM_getValue(lockKey, null);
+      if (!current || current.until < now || current.owner === TAB_ID) {
+        GM_setValue(lockKey, { owner: TAB_ID, until: now + REQUEST_LEASE_MS });
+        if (GM_getValue(lockKey, null)?.owner === TAB_ID) return { cached: null, release: () => {
+          if (GM_getValue(lockKey, null)?.owner === TAB_ID) GM_deleteValue(lockKey);
+        } };
+      }
+      await sleep(350 + Math.floor(Math.random() * 150));
+    }
+    return { cached: getEntry(key), release: () => {} };
+  }
+
+  // ---------- job queue ----------
+  // Order: on-screen unseen first, on-screen seen, off-screen unseen, off-screen seen.
+  // MAL takes everything; Jikan is a fallback that also helps once the queue is deep.
+  const MAX_ATTEMPTS = 2;
+  const queue = [];
+  const metrics = { lookups: 0, requests: 0, cacheHits: 0, bulkHits: 0, failures: 0, retries: 0, startedAt: Date.now() };
+  const visible = new Map(); // "type:id" -> number of its links currently on screen
+
+  function enqueue(type, id) {
+    return new Promise(resolve => {
+      metrics.requests++;
+      queue.push({
+        key: `${type}:${id}`,
+        type,
+        id,
+        resolve,
+        seenRank: isSeenAnime(type, id) ? 1 : 0,
+        attempts: { jikan: 0, mal: 0 },
+      });
+      lanes.forEach(startLane);
+    });
+  }
+
+  function takeJob(lane) {
+    if (sourceCoolingDown(lane)) {
+      scheduleSourceWake(lane);
+      return null;
+    }
+    const malUp = !sourceCoolingDown(laneByName.mal);
+    const assistOnly = lane.name === 'jikan' && malUp && queue.length <= JIKAN_ASSIST_QUEUE;
+    let best = -1;
+    let bestRank = Infinity;
+    for (let i = 0; i < queue.length; i++) {
+      const j = queue[i];
+      if (j.attempts[lane.name] >= MAX_ATTEMPTS) continue;
+      if (assistOnly && j.attempts.mal < MAX_ATTEMPTS) continue;
+      const rank = (visible.has(j.key) ? 0 : 2) + j.seenRank;
+      if (rank < bestRank) {
+        best = i;
+        bestRank = rank;
+        if (rank === 0) break;
+      }
+    }
+    return best === -1 ? null : queue.splice(best, 1)[0];
+  }
+
+  function handleFailure(lane, job) {
+    recordSourceFailure(lane);
+    const total = Object.values(job.attempts).reduce((a, b) => a + b, 0);
+    if (total > 1) metrics.retries++;
+    if (Object.values(job.attempts).every(n => n >= MAX_ATTEMPTS)) {
+      metrics.failures++;
+      job.resolve(null);
+    } else {
+      queue.push(job); // the other source (or a later retry) gets a go
+      lanes.forEach(startLane);
+    }
+  }
+
+  async function startLane(lane) {
+    if (lane.running) return;
+    lane.running = true;
+    let job = takeJob(lane);
+    while (job) {
+      const cached = getEntry(job.key); // another tab may have fetched it meanwhile
+      if (isFresh(cached)) {
+        metrics.cacheHits++;
+        job.resolve({ ...cached, fromCache: true });
+      } else {
+        const lease = await acquireScoreLease(job.key);
+        if (isFresh(lease.cached)) {
+          metrics.cacheHits++;
+          lease.release();
+          job.resolve({ ...lease.cached, fromCache: true });
+          job = takeJob(lane);
+          continue;
+        }
+        if (lane.name !== 'jikan') await reserveSlot(lane); // API requests reserve their own slot, including retries
+        job.attempts[lane.name]++;
+        let entry = null;
+        try { entry = await lane.run(job.type, job.id, lane); }
+        catch (e) { log(`${lane.name} lane error`, e); }
+        if (entry && typeof entry === 'object' && (validScore(entry.score) || entry.score == null)) {
+          entry.source = lane.name;
+          setEntry(job.key, entry); // publish before releasing the lease for waiting tabs
+          lease.release();
+          recordSourceSuccess(lane);
+          job.resolve(validScore(entry.score) ? entry : { ...entry, score: null });
+        } else {
+          lease.release();
+          handleFailure(lane, job);
+        }
+      }
+      job = takeJob(lane);
+    }
+    lane.running = false;
+  }
+
+  // ---------- fetching a single score ----------
+  const inFlight = new Map();
+
+  // cb(data, final): called with the best known value first (final=false) when there is one,
+  // then once more with the definitive result (final=true).
+  function fetchScore(type, id, cb, opts = {}) {
+    metrics.lookups++;
+    const key = `${type}:${id}`;
+    const { entry: known, fresh } = lookupKnown(type, id);
+
+    if (fresh && !opts.force) {
+      if (known.source === 'bulk') metrics.bulkHits++;
+      else metrics.cacheHits++;
+      return cb(known, true);
+    }
+    if (known) {
+      if (known.source === 'bulk') metrics.bulkHits++;
+      cb(known, false); // stale values and old bulk values show instantly and refresh quietly
+    } else if (allSourcesCooling()) {
+      cb({ score: null, paused: true }, false);
+    }
+
+    if (inFlight.has(key)) { inFlight.get(key).push(cb); return; }
+    inFlight.set(key, [cb]);
+
+    enqueue(type, id).then(entry => {
+      const cbs = inFlight.get(key) || [];
+      inFlight.delete(key);
+      if (entry) {
+        if (!entry.fromCache) setEntry(key, entry);
+        cbs.forEach(f => f(entry, true));
+      } else {
+        // Preserve any known score on failure; only show N/A when nothing is known.
+        cbs.forEach(f => f(known || { score: null, error: true }, true));
+      }
+    }).catch(error => {
+      log('score job failed', key, error);
+      const cbs = inFlight.get(key) || [];
+      inFlight.delete(key);
+      cbs.forEach(f => f(known || { score: null, error: true }, true));
+    });
+  }
+
+  // ---------- badge rendering ----------
+  // Every link gets one chip right after it; the score segment and the list segment live inside it.
+  function getChip(link) {
+    let chip = link._malChip;
+    if (!chip) {
+      chip = document.createElement('span');
+      chip.className = 'mal-chip';
+      link._malChip = chip;
+      link.insertAdjacentElement('afterend', chip);
+    }
+    return chip;
+  }
+
+  function scoreTier(score) {
+    if (score >= 8) return 't-great';
+    if (score >= 7) return 't-good';
+    if (score >= 6) return 't-mixed';
+    return 't-poor';
+  }
+
+  function renderBadge(link, data) {
+    let badge = link._malBadge;
+    if (!badge) {
+      badge = document.createElement('span');
+      link._malBadge = badge;
+      getChip(link).insertAdjacentElement('afterbegin', badge); // score segment is always first
+    }
+
+    if (data.loading || data.paused) {
+      badge.className = 'mal-seg mal-score loading';
+      badge.textContent = '…';
+      badge.title = data.paused || allSourcesCooling() ? 'Score sources are paused; retrying automatically' : 'Loading score…';
+    } else if (validScore(data.score)) {
+      badge.className = `mal-seg mal-score ${scoreTier(data.score)}`;
+      badge.textContent = data.score.toFixed(2);
+      const parts = [];
+      if (data.scoredBy) parts.push(`${data.scoredBy.toLocaleString()} users`);
+      if (data.rank) parts.push(`Rank #${data.rank.toLocaleString()}`);
+      if (data.t) parts.push(`cached ${new Date(data.t).toLocaleDateString()}`);
+      parts.push(`Source: ${data.source || (data.fromCache ? 'cache' : 'live')}`);
+      if (data.title) parts.push(data.title);
+      badge.title = settings.tooltips ? parts.join(' • ') : `MAL score ${data.score.toFixed(2)}`;
+    } else {
+      badge.className = 'mal-seg mal-score na';
+      badge.textContent = 'N/A';
+      badge.title = data.error ? 'Could not load score. Open the MAL Inline Scores dashboard to retry.' : 'No score yet';
+    }
+  }
+
+  // Re-render every settled badge from what is known (used when display settings change).
+  function refreshAllBadges() {
+    document.querySelectorAll(LINK_SELECTOR).forEach(link => {
+      if (!link._malInfo || !link._malBadge || link._malBadge.classList.contains('loading')) return;
+      const { entry } = lookupKnown(link._malInfo.type, link._malInfo.id);
+      if (entry) renderBadge(link, entry);
+    });
+  }
+
+  // ---------- your own anime list ----------
+  // Imported from MAL's list endpoint (public lists, or your own while logged in)
+  // and kept as one compact object: { user, t, items: { animeId: [status, score, watched, total] } }
+  const LIST_KEY = 'list:anime';
+  const LIST_REFRESH_MS = 24 * 60 * 60 * 1000;
+  const STATUS_NAMES = { 1: 'Watching', 2: 'Completed', 3: 'On hold', 4: 'Dropped', 6: 'Plan to watch' };
+  const SEEN_STATUSES = [2, 4];
+  let myList = GM_getValue(LIST_KEY, null);
+
+  const isSeenAnime = (type, id) => type === 'anime' && settings.seen !== 'off'
+    && Boolean(myList && myList.items[id] && SEEN_STATUSES.includes(myList.items[id][0]));
+
+  function renderListBadge(link) {
+    const info = link._malInfo;
+    if (!info || info.type !== 'anime') return;
+    const item = myList && myList.items[info.id];
+    let badge = link._malListBadge;
+    if (!item) {
+      if (badge) {
+        badge.remove();
+        link._malListBadge = null;
+      }
+      return;
+    }
+    if (!badge) {
+      badge = document.createElement('span');
+      link._malListBadge = badge;
+      getChip(link).insertAdjacentElement('beforeend', badge);
+    }
+    const [status, score, watched, total] = item;
+    const progress = `${watched}/${total || '?'}`;
+    const label = {
+      1: `▶ ${progress}`, 2: score ? `✓ ${score}` : '✓', 3: `‖ ${progress}`, 4: `✗ ${progress}`, 6: 'PTW',
+    }[status] || '?';
+    badge.className = `mal-seg mal-list s${status}`;
+    badge.textContent = status !== 2 && score ? `${label} · ${score}` : label;
+    badge.title = [
+      `On ${myList.user}'s list: ${STATUS_NAMES[status] || 'Unknown'}`,
+      score ? `your score ${score}` : 'not scored',
+      `${progress} episodes`,
+    ].join(' • ');
+  }
+
+  // Anime already completed or dropped can be dimmed, or hidden when their list row holds only them.
+  function countAnimeLinks(row) {
+    let n = 0;
+    row.querySelectorAll(LINK_SELECTOR).forEach(a => {
+      const info = parseLink(a);
+      if (info && info.type === 'anime') n++;
+    });
+    return n;
+  }
+
+  function clearSeen(link) {
+    link.classList.remove('mal-seen');
+    if (link._malChip) link._malChip.classList.remove('mal-seen');
+    if (link._malHiddenRow) {
+      link._malHiddenRow.classList.remove('mal-hide-seen');
+      link._malHiddenRow = null;
+    }
+  }
+
+  function applySeen(link) {
+    clearSeen(link);
+    const info = link._malInfo;
+    if (!info || !isSeenAnime(info.type, info.id)) return;
+    if (location.pathname.startsWith('/animelist/')) return;
+    const row = link.closest('li');
+    if (settings.seen === 'hide' && row && countAnimeLinks(row) === 1) {
+      row.classList.add('mal-hide-seen');
+      link._malHiddenRow = row;
+      return;
+    }
+    link.classList.add('mal-seen');
+    if (link._malChip) link._malChip.classList.add('mal-seen');
+  }
+
+  function refreshListBadges() {
+    document.querySelectorAll(LINK_SELECTOR).forEach(a => {
+      if (!a._malInfo) return;
+      renderListBadge(a);
+      applySeen(a);
+    });
+  }
+
+  // ---------- tasks: one at a time, with progress and cancellation ----------
+  function updateTask(label, done, total, message) {
+    Object.assign(taskState, { active: true, label, done: done || 0, total: total || 0, message: message || '' });
+    renderDashboardStatus();
+  }
+  function finishTask(message) {
+    Object.assign(taskState, { active: false, cancelled: false, label: '', message: message || 'Ready' });
+    renderDashboardStatus();
+  }
+  function checkCancelled() {
+    if (taskState.cancelled) throw new Error(CANCELLED);
+  }
+
+  async function runTask(label, worker, silent) {
+    if (taskState.active) {
+      if (!silent) toast('Another task is already running');
+      return { ok: false };
+    }
+    taskState.cancelled = false;
+    updateTask(label, 0, 0, 'Starting…');
+    try {
+      const result = await worker();
+      finishTask(`${label}: done`);
+      return { ok: true, result };
+    } catch (e) {
+      const cancelled = e.message === CANCELLED;
+      finishTask(cancelled ? `${label}: cancelled` : `${label} failed: ${e.message}`);
+      if (!silent) toast(cancelled ? `${label} cancelled` : `${label} failed: ${e.message}`);
+      return { ok: false, cancelled, error: e.message };
+    }
+  }
+
+  async function fetchMyList(user) {
+    const items = {};
+    for (let offset = 0; ; offset += 300) {
+      checkCancelled();
+      updateTask('Importing MAL list', offset, 0, `Loaded ${Object.keys(items).length.toLocaleString()} anime`);
+      let rows = null;
+      for (let tries = 0; tries < 3 && !rows; tries++) {
+        // MAL's own list endpoint must share the MAL request lane, not Jikan's.
+        await reserveSlot(laneByName.mal);
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 20000);
+        let res;
+        try {
+          res = await fetch(
+            `https://myanimelist.net/animelist/${encodeURIComponent(user)}/load.json?offset=${offset}&status=7`,
+            { credentials: 'same-origin', signal: controller.signal },
+          );
+        } catch (e) {
+          if (tries >= 2) throw new Error(e.name === 'AbortError' ? 'MAL list request timed out' : 'MAL list request failed');
+          await sleep(1000 * (tries + 1));
+          continue;
+        } finally {
+          clearTimeout(timeout);
+        }
+        if (res.status === 429 || res.status >= 500) {
+          penalize(laneByName.mal, res.status === 429 ? 15000 : 4000);
+          if (tries < 2) await sleep(1500 * (tries + 1));
+          continue;
+        }
+        if (!res.ok) throw new Error(`HTTP ${res.status} (wrong username, or the list is private?)`);
+        try { rows = await res.json(); } catch (e) { rows = null; }
+      }
+      if (!Array.isArray(rows)) throw new Error('unexpected response from MAL (rate limited?)');
+      for (const r of rows) {
+        items[r.anime_id] = [r.status, r.score, r.num_watched_episodes, r.anime_num_episodes];
+      }
+      if (rows.length < 300) break;
+      await sleep(500);
+    }
+    return items;
+  }
+
+  async function importList(user, silent) {
+    const r = await runTask('List import', async () => {
+      const items = await fetchMyList(user);
+      checkCancelled();
+      myList = { user, t: Date.now(), items };
+      GM_setValue(LIST_KEY, myList);
+      refreshListBadges();
+      return Object.keys(items).length;
+    }, silent);
+    if (r.ok) {
+      log(`imported ${r.result} anime from ${user}'s list`);
+      if (!silent) toast(`Imported ${r.result.toLocaleString()} anime from ${user}'s list.`);
+    }
+    renderDashboardIfOpen();
+  }
+
+  function parseUser(input) {
+    const text = (input || '').trim();
+    const m = text.match(/(?:animelist|mangalist|profile)\/([^/?#\s]+)/i);
+    if (m) return decodeURIComponent(m[1]);
+    return /^[\w-]{2,16}$/.test(text) ? text : null;
+  }
+
+  // Quietly refresh once a day; the shared lock stops several tabs doing it at once.
+  setTimeout(() => {
+    if (!myList || Date.now() - myList.t < LIST_REFRESH_MS || taskState.active) return;
+    if (Date.now() - GM_getValue('meta:listLock', 0) < 2 * 60 * 1000) return;
+    GM_setValue('meta:listLock', Date.now());
+    importList(myList.user, true);
+  }, 4000);
+
+  // ---------- visibility tracking ----------
+  function markVisible(link, on) {
+    if (on === Boolean(link._malVisible)) return;
+    link._malVisible = on;
+    const n = (visible.get(link._malKey) || 0) + (on ? 1 : -1);
+    if (n > 0) visible.set(link._malKey, n);
+    else visible.delete(link._malKey);
+  }
+
+  function stopTracking(link) {
+    markVisible(link, false);
+    observer.unobserve(link);
+  }
+
+  function requestScore(link) {
+    if (link._malRequested) return;
+    link._malRequested = true;
+    const { type, id } = link._malInfo;
+    fetchScore(type, id, (data, final) => {
+      renderBadge(link, data);
+      if (final) stopTracking(link);
+    });
+  }
+
+  const observer = new IntersectionObserver(entries => {
+    entries.forEach(entry => {
+      const link = entry.target;
+      markVisible(link, entry.isIntersecting);
+      if (entry.isIntersecting) requestScore(link);
+    });
+  }, { rootMargin: '600px' });
+
+  // ---------- link detection (incremental: only newly added DOM is scanned) ----------
+  function parseLink(a) {
+    let url;
+    try { url = new URL(a.href, location.href); } catch (e) { return null; }
+    if (url.hostname !== 'myanimelist.net') return null;
+    const m = url.pathname.match(LINK_RE);
+    if (!m || (m[1] === 'manga' && !settings.manga)) return null;
+    return { type: m[1], id: m[2] };
+  }
+
+  const seen = new WeakSet();
+
+  function isTitleLikeLink(a) {
+    const label = (a.textContent || '').replace(/\s+/g, ' ').trim().toLocaleLowerCase();
+    if (!label || NON_TITLE_LABELS.has(label)) return false;
+
+    // MAL detail pages can link the same entry from a "Source:" field, where the
+    // anchor is a media-type label rather than the anime/manga title.
+    const parentText = (a.parentElement?.textContent || '').replace(/\s+/g, ' ').trim().toLocaleLowerCase();
+    if (/^source\s*:\s*$/.test(parentText.replace(label, '').trim())) return false;
+    if (/^source\s*:\s*(web manga|manga|light novel|novel|visual novel|game|original|other)\s*$/.test(parentText)) return false;
+
+    // Skip links used as relationship/source metadata, not as title links.
+    if (a.closest('#related_entries, .related-entries, .anime_detail_related_anime, .anime_detail_related_manga')) return false;
+    return true;
+  }
+
+  function processLink(a) {
+    if (seen.has(a)) return;
+    if (!a.textContent.trim()) return;
+    seen.add(a);
+    if (a.closest('#headerSmall, .header-menu, #footer, .horiznav_nav, #mis-dashboard')) return;
+    if (!isTitleLikeLink(a)) return;
+    const info = parseLink(a);
+    if (!info) return;
+    if (a.nextElementSibling?.classList.contains('mal-chip')) return;
+
+    a._malInfo = info;
+    a._malKey = `${info.type}:${info.id}`;
+    const { entry: known, fresh } = lookupKnown(info.type, info.id);
+    if (fresh) {
+      renderBadge(a, known); // fresh live cache or fresh bulk score: no network needed
+    } else {
+      renderBadge(a, known || { loading: true }); // stale/bulk values appear immediately
+      observer.observe(a); // fetched or refreshed once it is near the viewport
+    }
+    renderListBadge(a);
+    applySeen(a);
+  }
+
+  function scanRoot(root) {
+    if (root.matches?.(LINK_SELECTOR)) processLink(root);
+    if (root.querySelectorAll) root.querySelectorAll(LINK_SELECTOR).forEach(processLink);
+  }
+
+  scanRoot(document.body);
+
+  const pendingRoots = new Set();
+  let scanTimer;
+  function flushPendingRoots() {
+    scanTimer = null;
+    const candidates = [...pendingRoots]; pendingRoots.clear();
+    const roots = candidates.filter(node => !candidates.some(other => other !== node && other.contains?.(node)));
+    const links = new Set();
+    for (const root of roots) {
+      if (root.matches?.(LINK_SELECTOR)) links.add(root);
+      root.querySelectorAll?.(LINK_SELECTOR).forEach(link => links.add(link));
+    }
+    const batch = [...links]; let index = 0;
+    const processBatch = () => {
+      const end = Math.min(index + 160, batch.length);
+      for (; index < end; index++) processLink(batch[index]);
+      if (index < batch.length) requestAnimationFrame(processBatch);
+    };
+    if (batch.length) requestAnimationFrame(processBatch);
+  }
+  new MutationObserver(mutations => {
+    for (const m of mutations) for (const n of m.addedNodes) {
+      if (n.nodeType === 1 && !n.closest('.mal-chip, #mis-dashboard, #mis-launcher, .mis-toast')) pendingRoots.add(n);
+    }
+    if (!pendingRoots.size) return;
+    clearTimeout(scanTimer); scanTimer = setTimeout(flushPendingRoots, 180);
+  }).observe(document.body, { childList: true, subtree: true });
+
+  // ---------- forced refresh ----------
+  // Marks an entry stale (keeping its score on screen) and fetches it again right away.
+  function forceRefresh(key, silent) {
+    const m = key.match(/^(anime|manga):(\d+)$/);
+    if (!m) return;
+    const entry = getEntry(key);
+    if (entry && isFresh(entry)) GM_setValue(PREFIX + key, { ...entry, t: 0 });
+    fetchScore(m[1], m[2], data => {
+      document.querySelectorAll(LINK_SELECTOR).forEach(link => {
+        if (link._malKey === key && link._malBadge) renderBadge(link, data);
+      });
+    }, { force: true });
+    if (!silent) toast(`Refreshing ${key}`);
+  }
+
+  function refreshVisibleScores() {
+    const keys = new Set();
+    document.querySelectorAll(LINK_SELECTOR).forEach(link => {
+      if (link._malInfo && link._malBadge) keys.add(link._malKey);
+    });
+    keys.forEach(k => forceRefresh(k, true));
+    toast(`Refreshing ${keys.size} scores on this page`);
+  }
+
+  async function testAllProviders() {
+    const r = await runTask('API diagnostics', async () => {
+      const results = [];
+      for (const provider of PROVIDER_ORDER) {
+        checkCancelled();
+        updateTask('API diagnostics', results.length, PROVIDER_ORDER.length, `Testing ${apiName(provider)}…`);
+        const started = Date.now();
+        try {
+          // Lightweight real data request also validates JSON shape and provider reachability.
+          const json = await apiGet('/top/anime?page=1&limit=1', 0, provider, PROVIDER_ORDER.length, [...PROVIDER_ORDER]);
+          const rows = Array.isArray(json?.data) ? json.data : [];
+          if (!rows.length) throw new Error('API responded but returned no anime rows');
+          providerHealth[provider] = { testedAt: Date.now(), ok: true, ms: Date.now() - started, status: 200, error: '' };
+          results.push(`${apiName(provider)}: OK (${Date.now() - started} ms)`);
+        } catch (e) {
+          providerHealth[provider] = { testedAt: Date.now(), ok: false, ms: Date.now() - started, status: providerHealth[provider].status, error: e.message };
+          results.push(`${apiName(provider)}: FAILED (${e.message})`);
+        }
+      }
+      return results;
+    });
+    if (r.ok) toast(r.result.join(' · '));
+    renderDashboardIfOpen();
+  }
+
+  // ---------- bulk preload through the selected API provider ----------
+  // All providers expose top anime and seasonal endpoints. The provider selector
+  // controls both individual lookups and bulk preload requests.
+  function preloadEndpoint(basePath, page) {
+    if (settings.apiProvider === 'tenrai') {
+      if (basePath === '/top/anime') return `/top/anime?page=${page}&limit=50`;
+      if (basePath === '/seasons/now') return `/seasons/now?page=${page}&limit=50`;
+      if (basePath === '/seasons/upcoming') return `/seasons/upcoming?page=${page}&limit=50`;
+    } else if (settings.apiProvider === 'jikan-edge') {
+      if (basePath === '/top/anime') return `/top/anime?page=${page}`;
+      if (basePath === '/seasons/now') return `/seasons/now?page=${page}`;
+      if (basePath === '/seasons/upcoming') return `/seasons/upcoming?page=${page}`;
+    } else {
+      if (basePath === '/top/anime') return `/top/anime?page=${page}&limit=25`;
+      if (basePath === '/seasons/now') return `/seasons/now?page=${page}&limit=25`;
+      if (basePath === '/seasons/upcoming') return `/seasons/upcoming?page=${page}&limit=25`;
+    }
+    throw new Error(`Unsupported preload category: ${basePath}`);
+  }
+
+  function normalizePreloadRows(json) {
+    const rows = Array.isArray(json?.data) ? json.data : [];
+    return rows.map(d => {
+      const id = d?.malId ?? d?.mal_id ?? d?.id;
+      if (!id || !/^\d+$/.test(String(id))) return null;
+      return [String(id), toEntry(d)];
+    }).filter(Boolean);
+  }
+
+  async function preloadScores(basePath, maxPages, label) {
+    const providerAtStart = settings.apiProvider;
+    const r = await runTask(label, async () => {
+      let saved = 0;
+      const progressKey = `meta:preload:${providerAtStart}:${basePath}`;
+      const prior = GM_getValue(progressKey, null);
+      const resume = prior && prior.provider === providerAtStart && Number.isInteger(prior.nextPage) && prior.nextPage > 1 && confirm(`Resume ${label} from page ${prior.nextPage}?`);
+      const startPage = resume ? prior.nextPage : 1;
+      const previouslySaved = resume ? Number(prior.savedTotal || 0) : 0;
+      const pageSize = (providerAtStart === 'jikan-edge' || providerAtStart === 'tenrai') ? 50 : 25;
+      const pages = Math.max(1, Math.min(200, Math.ceil(maxPages * 25 / pageSize)));
+      for (let page = startPage; page <= pages; page++) {
+        checkCancelled();
+        updateTask(label, page - 1, pages, `Using ${{ jikan: 'Jikan', 'jikan-edge': 'Jikan Edge', tenrai: 'Tenrai' }[providerAtStart]} · page ${page} of ${pages} · ${saved.toLocaleString()} saved`);
+        const json = await apiGet(preloadEndpoint(basePath, page));
+        checkCancelled();
+        const rows = normalizePreloadRows(json);
+        if (!rows.length) {
+          if (page === 1) throw new Error(`${apiName()} returned no anime rows. Check the API response or try the other provider.`);
+          break;
+        }
+        const pageShards = new Map();
+        for (const [id, row] of rows) {
+          if (!validScore(row.score)) continue;
+          const existing = getBulkEntry('anime', id);
+          if (!existing || !validScore(existing.score) || Date.now() - (existing.t || 0) > BULK_FRESH_MS) {
+            const sk = shardKey(id);
+            if (!pageShards.has(sk)) pageShards.set(sk, { ...readShard(sk) });
+            pageShards.get(sk)[id] = [row.score, row.scoredBy, row.rank, row.title, Date.now()];
+          }
+          setEntry(`anime:${id}`, { ...row, source: 'preload' });
+          saved++;
+        }
+        pageShards.forEach((shard, key) => writeShard(key, shard));
+        GM_setValue(progressKey, { provider: providerAtStart, nextPage: page + 1, savedTotal: previouslySaved + saved, updatedAt: Date.now() });
+        log(`${apiName()} preload ${basePath} page ${page}/${pages} (${saved} saved)`);
+        updateTask(label, page, pages, `Page ${page} of ${pages} · ${saved.toLocaleString()} saved`);
+        if (rows.length < pageSize) break;
+        await sleep(1200); // Stay below Tenrai's public 4-requests-per-second limit.
+      }
+      if (!saved && !previouslySaved) throw new Error('No anime scores were found in the API response.');
+      GM_deleteValue(progressKey);
+      return previouslySaved + saved;
+    });
+    invalidateCaches();
+    if (r.ok) toast(`${label}: ${r.result.toLocaleString()} scores saved`);
+    renderDashboardIfOpen();
+  }
+
+  // ---------- bulk database import / export / backup ----------
+  // entries: array of [idString, { score, scoredBy, rank, title, t? }]
+  async function importBulkEntries(entries, label) {
+    const r = await runTask(label, async () => {
+      const byShard = new Map();
+      for (const [id, row] of entries) {
+        const sk = shardKey(id);
+        if (!byShard.has(sk)) byShard.set(sk, []);
+        byShard.get(sk).push([id, row]);
+      }
+      const keys = [...byShard.keys()];
+      let written = 0;
+      for (let i = 0; i < keys.length; i++) {
+        checkCancelled();
+        bulkCache.delete(keys[i]); // always merge into what is really stored
+        const shard = { ...readShard(keys[i]) };
+        for (const [id, row] of byShard.get(keys[i])) {
+          shard[id] = [row.score, row.scoredBy, row.rank, row.title, row.t || Date.now()];
+          written++;
+        }
+        writeShard(keys[i], shard);
+        if (i % 4 === 3) {
+          updateTask(label, i + 1, keys.length, `${written.toLocaleString()} scores written`);
+          await sleep(0); // let the page breathe
+        }
+      }
+      return written;
+    });
+    invalidateCaches();
+    if (r.ok) {
+      refreshAllBadges();
+      toast(`${label}: ${r.result.toLocaleString()} scores imported`);
+    }
+    renderDashboardIfOpen();
+    return r;
+  }
+
+  function bulkEntriesFromJson(parsed) {
+    const entries = [];
+    const rows = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.data) ? parsed.data : null;
+    if (rows) {
+      rows.forEach(row => {
+        const id = Number(row?.mal_id ?? row?.id);
+        if (!Number.isSafeInteger(id) || id <= 0) return;
+        const entry = normaliseEntry(row);
+        if (validScore(entry.score)) entries.push([String(id), entry]);
+      });
+    } else if (parsed && typeof parsed === 'object') {
+      Object.entries(parsed).forEach(([key, row]) => {
+        const m = key.match(/^(?:anime:)?(\d+)$/);
+        if (!m || !row || typeof row !== 'object') return;
+        const entry = { ...normaliseEntry(row), t: Number(row.t) > 0 ? Number(row.t) : 0 };
+        if (validScore(entry.score)) entries.push([m[1], entry]);
+      });
+    }
+    return entries;
+  }
+
+  async function importBulkFile(file) {
+    let parsed;
+    try {
+      parsed = JSON.parse(await file.text());
+    } catch (e) {
+      toast('Bulk import failed: invalid JSON file');
+      return;
+    }
+    const entries = bulkEntriesFromJson(parsed);
+    if (!entries.length) {
+      toast('Bulk import: no valid scores found in that file');
+      return;
+    }
+    await importBulkEntries(entries, 'Bulk import');
+  }
+
+  function exportBulkObject() {
+    const out = {};
+    for (const k of shardKeys()) {
+      const shard = readShard(k);
+      for (const id of Object.keys(shard)) {
+        const row = shard[id];
+        out[`anime:${id}`] = { score: row[0], scoredBy: row[1], rank: row[2], title: row[3], t: row[4] };
+      }
+    }
+    return out;
+  }
+
+  function importCacheObject(obj) {
+    let n = 0;
+    for (const [k, v] of Object.entries(obj || {})) {
+      if (!/^(anime|manga):\d+$/.test(k) || !v || typeof v !== 'object') continue;
+      const t = Number(v.t);
+      if (!Number.isFinite(t) || t < 0) continue;
+      GM_setValue(PREFIX + k, { ...normaliseEntry(v), t });
+      n++;
+    }
+    invalidateCaches();
+    return n;
+  }
+
+  function exportCache() {
+    const out = {};
+    allKeys().forEach(k => { out[k.slice(PREFIX.length)] = GM_getValue(k); });
+    downloadJson('mal-score-cache.json', out);
+    toast(`Exported ${Object.keys(out).length.toLocaleString()} cache entries`);
+  }
+
+  async function importCacheFile(file) {
+    try {
+      const n = importCacheObject(JSON.parse(await file.text()));
+      refreshAllBadges();
+      renderDashboardIfOpen();
+      toast(`Imported ${n.toLocaleString()} cache entries`);
+    } catch (e) {
+      toast('Import failed: invalid JSON file');
+    }
+  }
+
+  function exportEverything() {
+    const cache = {};
+    allKeys().forEach(k => { cache[k.slice(PREFIX.length)] = GM_getValue(k); });
+    downloadJson('mal-inline-scores-backup.json', {
+      app: 'mal-inline-scores', version: 1, exportedAt: Date.now(), settings, list: myList, cache, bulk: exportBulkObject(),
+    });
+    toast('Exported settings, list, cache and bulk scores');
+  }
+
+  async function importEverythingFile(file) {
+    let parsed;
+    try {
+      parsed = JSON.parse(await file.text());
+    } catch (e) {
+      toast('Restore failed: invalid JSON file');
+      return;
+    }
+    if (!parsed || parsed.app !== 'mal-inline-scores') {
+      toast('Restore failed: not a MAL Inline Scores backup');
+      return;
+    }
+    const mangaBefore = settings.manga;
+    if (parsed.settings) {
+      Object.assign(settings, normaliseSettings(parsed.settings));
+      saveSettings();
+      applySettings();
+    }
+    if (parsed.list && typeof parsed.list.user === 'string' && parsed.list.items && typeof parsed.list.items === 'object') {
+      myList = parsed.list;
+      GM_setValue(LIST_KEY, myList);
+    }
+    const cacheCount = importCacheObject(parsed.cache);
+    const bulkEntries = bulkEntriesFromJson(parsed.bulk);
+    if (bulkEntries.length) await importBulkEntries(bulkEntries, 'Restore bulk scores');
+    refreshListBadges();
+    refreshAllBadges();
+    renderDashboardIfOpen();
+    toast(`Restored backup (${cacheCount.toLocaleString()} cache, ${bulkEntries.length.toLocaleString()} bulk)`);
+    if (settings.manga !== mangaBefore) location.reload();
+  }
+
+  // ---------- dashboard helpers ----------
+  const uiStyle = document.createElement('style');
+  uiStyle.textContent = `
+    #mis-launcher,#mis-dashboard,#mis-dashboard *{box-sizing:border-box}
+    #mis-launcher{position:fixed;right:18px;bottom:18px;z-index:2147483646;border:0;border-radius:999px;background:#2e51a2;color:#fff;padding:11px 15px;font:600 13px/1.2 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;box-shadow:0 4px 18px #0004;cursor:pointer}
+    #mis-launcher[hidden]{display:none!important}
+    #mis-dashboard{position:fixed;right:18px;bottom:72px;width:min(440px,calc(100vw - 24px));max-height:min(78vh,760px);overflow:hidden;z-index:2147483647;background:#fff;color:#242936;border:1px solid #d9deea;border-radius:14px;box-shadow:0 12px 40px #0005;font:13px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;display:flex;flex-direction:column}
+    #mis-dashboard[hidden]{display:none!important}#mis-dashboard button,#mis-dashboard input,#mis-dashboard select{font:inherit}
+    #mis-dashboard button{cursor:pointer;border:1px solid #d6dbea;border-radius:8px;padding:7px 10px;background:#f6f8fc;color:#25304a}#mis-dashboard button.primary{background:#2e51a2;border-color:#2e51a2;color:#fff}#mis-dashboard button.danger{color:#a12626;border-color:#efcaca;background:#fff8f8}
+    #mis-dashboard button:disabled{opacity:.45;cursor:not-allowed}#mis-dashboard .mis-head{display:flex;align-items:center;gap:8px;padding:13px 14px;border-bottom:1px solid #e7eaf1;background:#f8f9fc}#mis-dashboard .mis-head strong{font-size:15px}#mis-dashboard .mis-grow{flex:1}
+    #mis-dashboard .mis-tabs{display:flex;gap:4px;padding:8px 10px;border-bottom:1px solid #e7eaf1;overflow:auto}#mis-dashboard .mis-tabs button{white-space:nowrap;border-color:transparent;background:transparent}#mis-dashboard .mis-tabs button[aria-selected=true]{background:#e9eefb;color:#254a9c;border-color:#d5def6;font-weight:700}
+    #mis-dashboard .mis-body{padding:14px;overflow:auto}#mis-dashboard .mis-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}#mis-dashboard .mis-stat{border:1px solid #e2e6ef;border-radius:10px;padding:10px;background:#fafbfe;min-width:0}#mis-dashboard .mis-stat small{display:block;color:#687185}#mis-dashboard .mis-stat b{display:block;font-size:20px;margin-top:3px;overflow-wrap:anywhere}
+    #mis-dashboard .mis-row{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:10px 0;border-bottom:1px solid #edf0f5}#mis-dashboard .mis-row:last-child{border-bottom:0}#mis-dashboard .mis-muted{color:#687185;font-size:12px}#mis-dashboard .mis-actions{display:flex;gap:7px;flex-wrap:wrap;margin-top:12px}#mis-dashboard .mis-field{display:flex;gap:7px;margin:7px 0}#mis-dashboard input[type=text],#mis-dashboard input[type=search],#mis-dashboard input[type=number]{min-width:0;width:100%;padding:8px 9px;border:1px solid #d6dbea;border-radius:8px;background:#fff;color:#242936}#mis-dashboard .mis-select{padding:7px;border:1px solid #d6dbea;border-radius:8px;background:#fff;color:#242936}#mis-dashboard .mis-switch{width:38px;height:22px;flex:none;border:0;border-radius:20px;padding:3px;background:#c8ceda;position:relative}#mis-dashboard .mis-switch:after{content:"";display:block;width:16px;height:16px;border-radius:50%;background:white;transition:transform .15s}#mis-dashboard .mis-switch[aria-checked=true]{background:#2e51a2}#mis-dashboard .mis-switch[aria-checked=true]:after{transform:translateX(16px)}
+    #mis-dashboard .mis-progress{height:7px;background:#e7eaf1;border-radius:8px;overflow:hidden;margin:8px 0}#mis-dashboard .mis-progress>div{height:100%;width:0;background:#2e51a2;transition:width .15s}#mis-dashboard .mis-cache-list{max-height:240px;overflow:auto;margin-top:8px;border:1px solid #e5e8ef;border-radius:8px}#mis-dashboard .mis-cache-item{padding:8px;border-bottom:1px solid #edf0f5;display:flex;align-items:center;gap:8px}#mis-dashboard .mis-cache-item:last-child{border:0}#mis-dashboard .mis-cache-item .mis-cache-title{min-width:0;flex:1;overflow-wrap:anywhere}#mis-dashboard .mis-note{padding:9px 10px;border-radius:8px;background:#f2f5fb;color:#4b5871;margin-top:9px}#mis-dashboard .mis-foot{padding:9px 14px;border-top:1px solid #e7eaf1;color:#697185;font-size:11px}
+    @media(prefers-color-scheme:dark){#mis-dashboard{background:#20232b;color:#edf0f7;border-color:#414653}#mis-dashboard .mis-head,#mis-dashboard .mis-stat{background:#282c36}#mis-dashboard .mis-tabs,#mis-dashboard .mis-head,#mis-dashboard .mis-foot{border-color:#414653}#mis-dashboard button{background:#303541;color:#edf0f7;border-color:#4a5060}#mis-dashboard button.primary{background:#587bd0;border-color:#587bd0}#mis-dashboard input[type=text],#mis-dashboard input[type=search],#mis-dashboard input[type=number],#mis-dashboard .mis-select{background:#292d37;color:#fff;border-color:#4a5060}#mis-dashboard .mis-stat{border-color:#414653}#mis-dashboard .mis-row,#mis-dashboard .mis-cache-item{border-color:#393e49}#mis-dashboard .mis-note{background:#2b3447;color:#dbe4ff}#mis-dashboard .mis-tabs button[aria-selected=true]{background:#303d5c;color:#dce6ff}}
+    @media(max-width:520px){#mis-dashboard{right:8px;bottom:66px;width:calc(100vw - 16px);max-height:80vh}#mis-launcher{right:10px;bottom:10px}}
+  `;
+  document.head.appendChild(uiStyle);
+
+  function element(tag, attrs = {}, text = '') {
+    const el = document.createElement(tag);
+    Object.entries(attrs).forEach(([k, v]) => {
+      if (k === 'class') el.className = v;
+      else if (k === 'style') el.style.cssText = v;
+      else if (k.startsWith('on') && typeof v === 'function') el.addEventListener(k.slice(2), v);
+      else if (v !== undefined && v !== null) el.setAttribute(k, String(v));
+    });
+    if (text !== '') el.textContent = text;
+    return el;
+  }
+  function button(label, action, cls = '') {
+    const b = element('button', { type: 'button', class: cls }, label);
+    b.addEventListener('click', action);
+    return b;
+  }
+  function rowCopy(label, description) {
+    const copy = element('div');
+    copy.append(element('div', {}, label));
+    if (description) copy.append(element('div', { class: 'mis-muted' }, description));
+    return copy;
+  }
+  function settingRow(label, description, value, onChange) {
+    const row = element('div', { class: 'mis-row' });
+    const sw = button('', () => onChange(!value), 'mis-switch');
+    sw.setAttribute('role', 'switch');
+    sw.setAttribute('aria-checked', String(value));
+    sw.setAttribute('aria-label', label);
+    row.append(rowCopy(label, description), sw);
+    return row;
+  }
+  function selectRow(label, description, value, options, onChange) {
+    const row = element('div', { class: 'mis-row' });
+    const sel = element('select', { 'aria-label': label, class: 'mis-select' });
+    options.forEach(([v, text]) => {
+      const o = element('option', { value: v }, text);
+      if (v === value) o.selected = true;
+      sel.append(o);
+    });
+    sel.addEventListener('change', () => onChange(sel.value));
+    row.append(rowCopy(label, description), sel);
+    return row;
+  }
+  function openFile(accept, callback) {
+    const input = element('input', { type: 'file', accept, style: 'display:none' });
+    input.addEventListener('change', () => {
+      const file = input.files && input.files[0];
+      input.remove();
+      if (file) callback(file);
+    });
+    document.body.append(input);
+    input.click();
+  }
+  function downloadJson(name, data) {
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = element('a', { href: url, download: name });
+    document.body.append(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 3000);
+  }
+  function clearChildren(node) {
+    while (node.firstChild) node.removeChild(node.firstChild);
+  }
+
+  // Snapshot of the live cache, rebuilt only when something changed (not on every keystroke).
+  function getCacheIndex() {
+    if (!cacheIndex) cacheIndex = allKeys().map(k => ({ key: k, id: k.slice(PREFIX.length), entry: GM_getValue(k) }));
+    return cacheIndex;
+  }
+
+  // Cheap to call often: results are memoised for 5 seconds.
+  function cacheSummary(force) {
+    if (force) invalidateCaches();
+    if (summaryMemo && Date.now() - summaryMemo.at < 5000) return summaryMemo.value;
+    let expired = 0;
+    let scores = 0;
+    let noScore = 0;
+    let bytes = 0;
+    const index = getCacheIndex();
+    for (const { entry } of index) {
+      if (!isFresh(entry)) expired++;
+      if (validScore(entry?.score)) scores++;
+      else noScore++;
+      try { bytes += JSON.stringify(entry).length * 2; } catch (e) { /* ignore non-serialisable legacy entries */ }
+    }
+    const value = {
+      total: index.length, expired, scores, noScore, bytes, bulk: bulkCount(), list: myList ? Object.keys(myList.items || {}).length : 0,
+    };
+    summaryMemo = { at: Date.now(), value };
+    return value;
+  }
+
+  function renderDashboardStatus() {
+    if (!dashboardStatus) return;
+    if (taskState.active) {
+      dashboardStatus.textContent = `${taskState.label}: ${taskState.message || 'Working…'}`;
+    } else {
+      const s = cacheSummary();
+      dashboardStatus.textContent = `${s.total.toLocaleString()} cached · ${s.bulk.toLocaleString()} bulk · ${s.list.toLocaleString()} list entries`;
+    }
+    if (dashboardProgress) {
+      dashboardProgress.hidden = !taskState.active;
+      const pct = taskState.total > 0 ? Math.min(100, taskState.done / taskState.total * 100) : (taskState.active ? 8 : 0);
+      dashboardProgress.firstElementChild.style.width = `${pct}%`;
+    }
+    if (dashboardProgressText) {
+      dashboardProgressText.textContent = taskState.active
+        ? `${taskState.message || taskState.label}${taskState.total ? ` · ${taskState.done}/${taskState.total}` : ''}`
+        : taskState.message || 'Ready';
+    }
+  }
+
+  function renderDashboardIfOpen() {
+    if (dashboardRoot && !dashboardRoot.hidden) renderDashboard();
+  }
+
+  function updateSetting(patch, reload) {
+    Object.assign(settings, patch);
+    saveSettings();
+    applySettings();
+    refreshListBadges();
+    refreshAllBadges();
+    if (reload) location.reload();
+    else renderDashboard();
+  }
+
+  function renderCacheResults() {
+    if (!cacheResults) return;
+    clearChildren(cacheResults);
+    const query = cacheFilter.trim().toLowerCase();
+    const matches = getCacheIndex().filter(x => !query || x.id.includes(query) || String(x.entry?.title || '').toLowerCase().includes(query));
+    const pages = Math.max(1, Math.ceil(matches.length / CACHE_PAGE_SIZE));
+    cachePage = Math.min(cachePage, pages - 1);
+    const page = matches.slice(cachePage * CACHE_PAGE_SIZE, (cachePage + 1) * CACHE_PAGE_SIZE);
+    if (!page.length) cacheResults.append(element('div', { class: 'mis-cache-item mis-muted' }, 'No matching cache entries.'));
+    page.forEach(({ key, id, entry }) => {
+      const item = element('div', { class: 'mis-cache-item' });
+      const copy = element('div', { class: 'mis-cache-title' });
+      copy.append(element('div', {}, entry?.title || id));
+      copy.append(element('div', { class: 'mis-muted' }, `${id} · ${validScore(entry?.score) ? entry.score.toFixed(2) : 'No score'} · ${isFresh(entry) ? 'fresh' : 'expired'} · ${entry?.source || 'unknown source'} · ${entry?.t ? new Date(entry.t).toLocaleDateString() : 'unknown date'}`));
+      item.append(copy, button('Refresh', () => forceRefresh(id, false)));
+      item.append(button('Delete', () => {
+        GM_deleteValue(key);
+        invalidateCaches();
+        renderCacheResults();
+        renderDashboardStatus();
+        toast('Cache entry deleted');
+      }, 'danger'));
+      cacheResults.append(item);
+    });
+    const pager = element('div', { class: 'mis-actions' });
+    pager.append(button('Previous', () => { cachePage = Math.max(0, cachePage - 1); renderCacheResults(); }));
+    pager.append(element('span', { class: 'mis-muted', style: 'align-self:center' }, `${matches.length.toLocaleString()} results · page ${cachePage + 1}/${pages}`));
+    pager.append(button('Next', () => { cachePage = Math.min(pages - 1, cachePage + 1); renderCacheResults(); }));
+    cacheResults.append(pager);
+  }
+
+  function statGrid(pairs) {
+    const grid = element('div', { class: 'mis-grid' });
+    pairs.forEach(([label, value]) => {
+      const card = element('div', { class: 'mis-stat' });
+      card.append(element('small', {}, label), element('b', {}, typeof value === 'string' ? value : Number(value).toLocaleString()));
+      grid.append(card);
+    });
+    return grid;
+  }
+
+  function exportDiagnostics() {
+    const report = {
+      app: 'MAL Inline Scores', version: '4.5.5', exportedAt: new Date().toISOString(),
+      selectedProvider: settings.apiProvider, automaticFailover: settings.autoFailover,
+      providers: providerHealth,
+      metrics: { ...metrics }, queueLength: queue.length,
+      sources: lanes.map(l => ({ name: l.name, coolingDown: sourceCoolingDown(l), cooldownUntil: Number(GM_getValue(`meta:disabled:${l.name}`, 0)) || null })),
+      cache: cacheSummary(true),
+      preloadProgress: GM_listValues().filter(k => k.startsWith('meta:preload:')).map(k => ({ key: k, value: GM_getValue(k) })),
+    };
+    downloadJson('mal-inline-scores-diagnostics.json', report);
+    toast('Diagnostics exported (no personal list titles included)');
+  }
+
+  function renderOverviewTab(body) {
+    const s = cacheSummary(true);
+    const size = s.bytes < 1048576 ? `${(s.bytes / 1024).toFixed(1)} KB` : `${(s.bytes / 1048576).toFixed(2)} MB`;
+    body.append(statGrid([
+      ['Live cache', s.total], ['Scored entries', s.scores], ['No score', s.noScore], ['Expired entries', s.expired],
+      ['Bulk scores', s.bulk], ['My list', s.list], ['Queue', queue.length], ['Approx. cache size', size],
+    ]));
+    const cooling = lanes.map(l => `${l.name}: ${sourceCoolingDown(l) ? `cooldown until ${new Date(Number(GM_getValue(`meta:disabled:${l.name}`, 0))).toLocaleTimeString()}` : 'available'}`).join(' · ');
+    body.append(element('div', { class: 'mis-note' }, `Sources — ${cooling}`));
+    body.append(element('div', { class: 'mis-note' }, `API health — ${PROVIDER_ORDER.map(p => { const h = providerHealth[p]; return `${apiName(p)}: ${h.ok === null ? 'not tested this session' : h.ok ? `OK · ${h.ms} ms` : `failed · ${h.error}`}`; }).join(' · ')}`));
+    const hitRate = metrics.lookups ? Math.round((metrics.cacheHits + metrics.bulkHits) / metrics.lookups * 100) : 0;
+    body.append(element('div', { class: 'mis-note' }, `This tab session: ${metrics.lookups.toLocaleString()} score lookups · ${metrics.requests.toLocaleString()} queued fetches · ${metrics.cacheHits.toLocaleString()} cache hits · ${metrics.bulkHits.toLocaleString()} bulk hits (${hitRate}% answered locally) · ${metrics.retries.toLocaleString()} retries · ${metrics.failures.toLocaleString()} final failures`));
+    const listRow = element('div', { class: 'mis-row' });
+    listRow.append(rowCopy('Personal MAL list', myList ? `${myList.user} · ${s.list.toLocaleString()} anime · refreshed ${new Date(myList.t).toLocaleString()}` : 'No list imported yet'));
+    body.append(listRow);
+    const actions = element('div', { class: 'mis-actions' });
+    actions.append(button('Refresh page scores', refreshVisibleScores, 'primary'));
+    actions.append(button('Refresh my list', () => {
+      if (!myList) { toast('Set your username in Settings first'); return; }
+      importList(myList.user, false);
+    }));
+    actions.append(button('Export everything', exportEverything));
+    actions.append(button('Export diagnostics', exportDiagnostics));
+    body.append(actions);
+  }
+
+  function renderSettingsTab(body) {
+    body.append(selectRow('Completed / dropped anime', 'What to do with anime already on your list as completed or dropped', settings.seen,
+      [['dim', 'Dim them'], ['hide', 'Hide their rows'], ['off', 'Leave alone']], v => updateSetting({ seen: v })));
+    body.append(selectRow('API provider', 'Used for individual score lookups and top/season preloads. Tenrai is a separately hosted, pre-cached alternative.', settings.apiProvider,
+      [['jikan', 'Jikan API (api.jikan.moe)'], ['jikan-edge', 'Jikan Edge (jikan.lucashdo.com)'], ['tenrai', 'Tenrai (api.tenrai.org)']], v => updateSetting({ apiProvider: v }, true)));
+    body.append(settingRow('Automatic API failover', 'If the selected provider times out, is throttled or returns a server error, try the other providers automatically. Successful provider choice remains unchanged.', settings.autoFailover, v => updateSetting({ autoFailover: v })));
+    body.append(button('Test all API providers', testAllProviders));
+    body.append(settingRow('Show manga scores', 'Include manga links (reloads the page)', settings.manga, v => updateSetting({ manga: v }, true)));
+    body.append(settingRow('Detailed score tooltips', 'Include score count, rank, source and cache date', settings.tooltips, v => updateSetting({ tooltips: v })));
+    body.append(settingRow('Compact badges', 'Smaller pills without the star', settings.compact, v => updateSetting({ compact: v })));
+    body.append(settingRow('Floating launcher button', 'Turn off to open this panel from the Tampermonkey menu only', settings.launcher, v => updateSetting({ launcher: v })));
+    body.append(element('div', { style: 'margin-top:14px;font-weight:700' }, 'Personal MAL username or list URL'));
+    const field = element('input', { type: 'text', placeholder: 'MAL username or /animelist/ URL', value: myList?.user || '' });
+    body.append(field);
+    const actions = element('div', { class: 'mis-actions' });
+    actions.append(button('Import / update list', () => {
+      const user = parseUser(field.value);
+      if (!user) { toast('Enter a valid MAL username or list URL'); return; }
+      importList(user, false);
+    }, 'primary'));
+    actions.append(button('Remove list', () => {
+      if (!confirm('Remove the saved personal list?')) return;
+      myList = null;
+      GM_deleteValue(LIST_KEY);
+      refreshListBadges();
+      renderDashboard();
+      toast('Personal list removed');
+    }, 'danger'));
+    body.append(actions);
+    body.append(element('div', { style: 'margin-top:14px;font-weight:700' }, 'Backup'));
+    body.append(element('div', { class: 'mis-muted' }, 'One file with settings, your list, the live cache and the bulk database.'));
+    const backup = element('div', { class: 'mis-actions' });
+    backup.append(button('Export everything', exportEverything));
+    backup.append(button('Restore from backup', () => openFile('.json,application/json', importEverythingFile)));
+    body.append(backup);
+  }
+
+  function renderCacheTab(body) {
+    const s = cacheSummary(true);
+    body.append(statGrid([['Live entries', s.total], ['Expired', s.expired], ['Bulk anime', s.bulk], ['Scored', s.scores]]));
+    const search = element('input', { type: 'search', placeholder: 'Search title or anime:ID…', value: cacheFilter, style: 'margin-top:12px' });
+    search.addEventListener('input', () => {
+      clearTimeout(searchTimer);
+      searchTimer = setTimeout(() => {
+        cacheFilter = search.value;
+        cachePage = 0;
+        renderCacheResults();
+      }, 250);
+    });
+    body.append(search);
+    cacheResults = element('div', { class: 'mis-cache-list' });
+    body.append(cacheResults);
+    renderCacheResults();
+    const actions = element('div', { class: 'mis-actions' });
+    actions.append(button('Import cache JSON', () => openFile('.json,application/json', importCacheFile)));
+    actions.append(button('Export cache JSON', exportCache));
+    actions.append(button('Clear expired', () => {
+      let n = 0;
+      allKeys().forEach(k => { if (!isFresh(GM_getValue(k))) { GM_deleteValue(k); n++; } });
+      renderDashboard();
+      toast(`Removed ${n} expired entries`);
+    }));
+    actions.append(button('Refresh expired', () => {
+      let n = 0;
+      allKeys().forEach(k => { if (!isFresh(GM_getValue(k))) { forceRefresh(k.slice(PREFIX.length), true); n++; } });
+      toast(`Refreshing ${n} expired entries in the background`);
+    }));
+    actions.append(button('Clear live cache', () => {
+      if (!confirm('Delete all live cached scores? Bulk scores will be kept.')) return;
+      allKeys().forEach(k => GM_deleteValue(k));
+      renderDashboard();
+      toast('Live cache cleared');
+    }, 'danger'));
+    actions.append(button('Import bulk JSON', () => openFile('.json,application/json', importBulkFile)));
+    actions.append(button('Export bulk JSON', () => {
+      const out = exportBulkObject();
+      downloadJson('mal-bulk-scores.json', out);
+      toast(`Exported ${Object.keys(out).length.toLocaleString()} bulk entries`);
+    }));
+    actions.append(button('Clear bulk', () => {
+      if (!confirm('Delete all bulk scores? Live cache will be kept.')) return;
+      shardKeys().forEach(k => GM_deleteValue(k));
+      GM_listValues().filter(k => k.startsWith(LEGACY_BULK_PREFIX)).forEach(k => GM_deleteValue(k));
+      bulkCache.clear();
+      legacyBulkPending = false;
+      renderDashboard();
+      toast('Bulk database cleared');
+    }, 'danger'));
+    body.append(actions);
+  }
+
+  function renderTasksTab(body) {
+    body.append(element('div', { class: 'mis-muted' }, 'Long-running imports and preloads share one progress display. You can cancel between steps; a request already in flight may finish first.'));
+    const actions = element('div', { class: 'mis-actions' });
+    actions.append(button('Preload top anime', () => {
+      const n = Math.max(25, Math.min(5000, Number(prompt('How many top anime? (25–5000)', '500')) || 0));
+      if (n) preloadScores('/top/anime', Math.ceil(n / 25), 'Top anime preload');
+    }));
+    actions.append(button('Preload current season', () => preloadScores('/seasons/now', 20, 'Current season')));
+    actions.append(button('Preload upcoming season', () => preloadScores('/seasons/upcoming', 20, 'Upcoming season')));
+    actions.append(button('Cancel task', () => {
+      if (!taskState.active) return;
+      taskState.cancelled = true;
+      taskState.message = 'Cancellation requested…';
+      renderDashboardStatus();
+      toast('Cancellation requested');
+    }, 'danger'));
+    body.append(actions);
+    body.append(element('div', { class: 'mis-note' }, taskState.active ? `${taskState.label}: ${taskState.message}` : taskState.message || 'No task currently running'));
+  }
+
+  function renderDashboard() {
+    if (!dashboardRoot) return;
+    const body = dashboardRoot.querySelector('.mis-body');
+    clearChildren(body);
+    cacheResults = null;
+    if (dashboardTab === 'overview') renderOverviewTab(body);
+    else if (dashboardTab === 'settings') renderSettingsTab(body);
+    else if (dashboardTab === 'cache') renderCacheTab(body);
+    else renderTasksTab(body);
+    renderDashboardStatus();
+  }
+
+  function buildDashboard() {
+    launcherEl = button('MAL Scores', () => {
+      dashboardRoot.hidden = !dashboardRoot.hidden;
+      if (!dashboardRoot.hidden) renderDashboard();
+    });
+    launcherEl.id = 'mis-launcher';
+    launcherEl.title = 'Open MAL Inline Scores settings';
+    launcherEl.hidden = !settings.launcher;
+    dashboardRoot = element('section', { id: 'mis-dashboard', hidden: '' });
+    const head = element('div', { class: 'mis-head' });
+    head.append(element('strong', {}, 'MAL Inline Scores'), element('span', { class: 'mis-grow' }));
+    dashboardStatus = element('span', { class: 'mis-muted' }, 'Ready');
+    head.append(dashboardStatus);
+    head.append(button('×', () => { dashboardRoot.hidden = true; }));
+    dashboardRoot.append(head);
+    const tabs = element('nav', { class: 'mis-tabs', role: 'tablist' });
+    [['overview', 'Overview'], ['settings', 'Settings'], ['cache', 'Cache'], ['tasks', 'Imports & preload']].forEach(([id, label]) => {
+      const b = button(label, () => {
+        dashboardTab = id;
+        tabs.querySelectorAll('button').forEach(x => x.setAttribute('aria-selected', String(x.dataset.tab === id)));
+        renderDashboard();
+      });
+      b.dataset.tab = id;
+      b.setAttribute('role', 'tab');
+      b.setAttribute('aria-selected', String(id === dashboardTab));
+      tabs.append(b);
+    });
+    dashboardRoot.append(tabs);
+    const progressWrap = element('div', { style: 'padding:0 14px 6px' });
+    dashboardProgressText = element('div', { class: 'mis-muted' }, 'Ready');
+    progressWrap.append(dashboardProgressText);
+    dashboardProgress = element('div', { class: 'mis-progress', hidden: '' });
+    dashboardProgress.append(element('div'));
+    progressWrap.append(dashboardProgress);
+    dashboardRoot.append(progressWrap);
+    dashboardRoot.append(element('div', { class: 'mis-body' }));
+    dashboardRoot.append(element('div', { class: 'mis-foot' }, 'MAL Inline Scores · selectable Jikan / Jikan Edge / Tenrai APIs · settings saved in Tampermonkey storage'));
+    document.body.append(launcherEl, dashboardRoot);
+    renderDashboard();
+  }
+  if (document.body) buildDashboard();
+  else document.addEventListener('DOMContentLoaded', buildDashboard, { once: true });
+
+  // Esc or a click outside closes the panel.
+  document.addEventListener('keydown', e => {
+    if (e.key === 'Escape' && dashboardRoot && !dashboardRoot.hidden) dashboardRoot.hidden = true;
+  });
+  document.addEventListener('mousedown', e => {
+    if (!dashboardRoot || dashboardRoot.hidden) return;
+    if (dashboardRoot.contains(e.target) || e.target.closest?.('#mis-launcher')) return;
+    dashboardRoot.hidden = true;
+  }, true);
+
+  // ---------- keep other tabs in sync ----------
+  if (typeof GM_addValueChangeListener === 'function') {
+    GM_addValueChangeListener(LIST_KEY, (name, oldValue, newValue, remote) => {
+      if (!remote) return;
+      myList = newValue || null;
+      refreshListBadges();
+      renderDashboardIfOpen();
+    });
+    GM_addValueChangeListener(SETTINGS_KEY, (name, oldValue, newValue, remote) => {
+      if (!remote) return;
+      const next = normaliseSettings(newValue);
+      const mangaChanged = next.manga !== settings.manga;
+      Object.assign(settings, next);
+      applySettings();
+      refreshListBadges();
+      refreshAllBadges();
+      if (!mangaChanged) renderDashboardIfOpen();
+    });
+  }
+
+  GM_registerMenuCommand('Open MAL Inline Scores dashboard', () => {
+    if (!dashboardRoot) return;
+    dashboardRoot.hidden = false;
+    renderDashboard();
+  });
+})();
